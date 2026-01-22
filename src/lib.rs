@@ -1,0 +1,172 @@
+mod tls;
+
+use {
+    anyhow::{Context, Result, anyhow},
+    arc_swap::ArcSwap,
+    tls::{SkipServerVerification, crypto_provider},
+    quinn::{
+        ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
+        crypto::rustls::QuicClientConfig,
+    },
+    rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair},
+    solana_transaction::versioned::VersionedTransaction,
+    std::{net::SocketAddr, sync::Arc, time::Duration},
+    tokio::sync::Mutex,
+    tracing::warn,
+    uuid::Uuid,
+};
+
+const ALPN_FALCON_TX: &[u8] = b"falcon-tx";
+const SERVER_NAME: &str = "falcon";
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(25);
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_millis(200);
+const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn generate_client_cert(
+    api_key: Uuid,
+) -> Result<(
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .map_err(|e| anyhow!("keypair generation failed: {e}"))?;
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, api_key.to_string());
+
+    let mut params = CertificateParams::default();
+    params.distinguished_name = dn;
+    params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+    params.not_after = rcgen::date_time_ymd(4096, 1, 1);
+
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| anyhow!("cert generation failed: {e}"))?;
+
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+        .map_err(|e| anyhow!("key serialization failed: {e}"))?;
+
+    Ok((cert_der, key_der))
+}
+
+pub struct FalconClient {
+    endpoint: Endpoint,
+    client_config: ClientConfig,
+    addr: SocketAddr,
+    connection: ArcSwap<Connection>,
+    reconnect: Mutex<()>,
+}
+
+impl FalconClient {
+    pub async fn connect(endpoint_addr: &str, api_key: Uuid) -> Result<Self> {
+        let (cert, key) = generate_client_cert(api_key)?;
+
+        let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .context("TLS config failed")?
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_client_auth_cert(vec![cert], key)
+            .context("client cert config failed")?;
+
+        crypto.alpn_protocols = vec![ALPN_FALCON_TX.to_vec()];
+
+        let quic_crypto =
+            QuicClientConfig::try_from(crypto).map_err(|e| anyhow!("QUIC config failed: {e}"))?;
+
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+        transport.max_idle_timeout(Some(
+            IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("valid timeout"),
+        ));
+
+        let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
+        client_config.transport_config(Arc::new(transport));
+
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+        endpoint.set_default_client_config(client_config.clone());
+
+        let addr = tokio::net::lookup_host(endpoint_addr)
+            .await
+            .context("DNS lookup failed")?
+            .next()
+            .ok_or_else(|| anyhow!("address resolution failed: {endpoint_addr}"))?;
+
+        let connection =
+            tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, SERVER_NAME)?)
+                .await
+                .context("connect timeout")??;
+
+        Ok(Self {
+            endpoint,
+            client_config,
+            addr,
+            connection: ArcSwap::from_pointee(connection),
+            reconnect: Mutex::new(()),
+        })
+    }
+
+    pub async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<()> {
+        let payload = bincode::serialize(transaction)?;
+
+        let connection = self.connection.load_full();
+        if Self::try_send(&connection, &payload).await.is_ok() {
+            return Ok(());
+        }
+
+        warn!("send failed, reconnecting");
+        self.reconnect(true).await?;
+
+        let connection = self.connection.load_full();
+        Self::try_send(&connection, &payload).await
+    }
+
+    async fn try_send(connection: &Connection, payload: &[u8]) -> Result<()> {
+        let mut stream = tokio::time::timeout(OPEN_STREAM_TIMEOUT, connection.open_uni())
+            .await
+            .context("open_uni timeout")??;
+
+        tokio::time::timeout(WRITE_TIMEOUT, async {
+            stream.write_all(payload).await?;
+            stream.finish()?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("write timeout")??;
+
+        Ok(())
+    }
+
+    async fn reconnect(&self, force: bool) -> Result<()> {
+        let conn_id_before = self.connection.load().stable_id();
+
+        let _guard = self.reconnect.lock().await;
+
+        let conn_id_after = self.connection.load().stable_id();
+        if conn_id_before != conn_id_after {
+            return Ok(());
+        }
+
+        if !force && self.is_connected() {
+            return Ok(());
+        }
+
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.endpoint
+                .connect_with(self.client_config.clone(), self.addr, SERVER_NAME)?,
+        )
+        .await
+        .context("connect timeout")??;
+
+        self.connection.store(Arc::new(connection));
+        Ok(())
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connection.load().close_reason().is_none()
+    }
+}

@@ -1,0 +1,25 @@
+[package]
+authors     = ["Corvus Labs"]
+description = "Falcon QUIC client for Solana transaction submission"
+edition     = "2024"
+homepage    = "https://falcon.wtf"
+license     = "Apache-2.0"
+name        = "falcon-client"
+repository  = "https://github.com/corvus-labs-io/falcon-client"
+version     = "0.0.1"
+
+[dependencies]
+anyhow    = "1"
+arc-swap  = "1"
+bincode   = "1.3.3"
+quinn     = "0.11.6"
+rcgen     = "0.14"
+rustls    = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
+serde     = { version = "1", features = ["derive"] }
+thiserror = "2.0.17"
+tokio     = { version = "1.48.0", features = ["sync", "time", "net"] }
+tracing   = "0.1.40"
+uuid      = { version = "1.11.0", features = ["serde"] }
+
+solana-signature   = "3.0.0"
+solana-transaction = { version = "3.0.0", features = ["bincode"] }
