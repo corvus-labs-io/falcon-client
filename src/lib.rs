@@ -170,3 +170,70 @@ impl FalconClient {
         self.connection.load().close_reason().is_none()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random_uuid() -> Uuid {
+        Uuid::from_bytes(rand::random())
+    }
+
+    #[test]
+    fn generate_client_cert_succeeds_with_valid_uuid() {
+        let api_key = random_uuid();
+
+        let result = generate_client_cert(api_key);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn generate_client_cert_returns_certificate_and_key() {
+        let api_key = random_uuid();
+
+        let (cert, key) = generate_client_cert(api_key).expect("cert generation");
+
+        assert!(!cert.as_ref().is_empty());
+        assert!(!key.secret_der().is_empty());
+    }
+
+    #[test]
+    fn generate_client_cert_uses_api_key_in_common_name() {
+        let api_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let (cert_der, _key) = generate_client_cert(api_key).expect("cert generation");
+
+        let cert_bytes = cert_der.as_ref();
+        let api_key_str = api_key.to_string();
+        let api_key_bytes = api_key_str.as_bytes();
+        assert!(
+            cert_bytes
+                .windows(api_key_bytes.len())
+                .any(|w| w == api_key_bytes),
+            "Certificate should contain API key in CN"
+        );
+    }
+
+    #[test]
+    fn generate_client_cert_different_keys_produce_different_certs() {
+        let api_key1 = random_uuid();
+        let api_key2 = random_uuid();
+
+        let (cert1, _) = generate_client_cert(api_key1).expect("cert1");
+        let (cert2, _) = generate_client_cert(api_key2).expect("cert2");
+
+        assert_ne!(cert1.as_ref(), cert2.as_ref());
+    }
+
+    #[test]
+    fn constants_have_expected_values() {
+        assert_eq!(ALPN_FALCON_TX, b"falcon-tx");
+        assert_eq!(SERVER_NAME, "falcon");
+        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(25));
+        assert_eq!(MAX_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(OPEN_STREAM_TIMEOUT, Duration::from_millis(200));
+        assert_eq!(WRITE_TIMEOUT, Duration::from_millis(500));
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
+    }
+}

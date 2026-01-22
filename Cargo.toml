@@ -23,3 +23,16 @@ uuid      = { version = "1.11.0", features = ["serde"] }
 
 solana-signature   = "3.0.0"
 solana-transaction = { version = "3.0.0", features = ["bincode"] }
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+rand  = "0.9"
+solana-pubkey = "3.0.0"
+solana-message = "3.0.0"
+
+[features]
+default = []
+test-utils = []
+
+[package.metadata.docs.rs]
+all-features = true
