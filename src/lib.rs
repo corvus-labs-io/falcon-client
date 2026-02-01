@@ -1,3 +1,22 @@
+//! Rust client library for submitting Solana transactions to Falcon via QUIC.
+//!
+//! # Quick Start
+//!
+//! ```no_run
+//! use falcon_client::FalconClient;
+//! use solana_transaction::versioned::VersionedTransaction;
+//! use uuid::Uuid;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let api_key = Uuid::parse_str("your-api-key-here")?;
+//! let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+//!
+//! let transaction: VersionedTransaction = todo!();
+//! client.send_transaction(&transaction).await?;
+//! # Ok(())
+//! # }
+//! ```
+
 mod tls;
 
 use {
@@ -52,6 +71,11 @@ fn generate_client_cert(
     Ok((cert_der, key_der))
 }
 
+/// QUIC client for submitting Solana transactions to Falcon.
+///
+/// Opens a persistent QUIC connection authenticated via mTLS — the API key
+/// is embedded in a self-signed client certificate. If the connection drops,
+/// sends automatically reconnect before retrying.
 pub struct FalconClient {
     endpoint: Endpoint,
     client_config: ClientConfig,
@@ -61,6 +85,11 @@ pub struct FalconClient {
 }
 
 impl FalconClient {
+    /// Opens a QUIC connection to Falcon.
+    ///
+    /// Resolves `endpoint_addr` via DNS, generates a self-signed client
+    /// certificate with `api_key` as the Common Name, and establishes the
+    /// QUIC session. Times out after 5 seconds.
     pub async fn connect(endpoint_addr: &str, api_key: Uuid) -> Result<Self> {
         let (cert, key) = generate_client_cert(api_key)?;
 
@@ -109,6 +138,11 @@ impl FalconClient {
         })
     }
 
+    /// Serializes and sends a transaction to Falcon.
+    ///
+    /// The transaction is bincode-encoded and written to a new unidirectional
+    /// QUIC stream. If the first attempt fails, the connection is
+    /// re-established and the send is retried once.
     pub async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<()> {
         let payload = bincode::serialize(transaction)?;
 
@@ -166,6 +200,7 @@ impl FalconClient {
         Ok(())
     }
 
+    /// Returns `true` if the QUIC connection is active.
     pub fn is_connected(&self) -> bool {
         self.connection.load().close_reason().is_none()
     }

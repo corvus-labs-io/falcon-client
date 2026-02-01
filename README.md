@@ -1,6 +1,6 @@
 # falcon-client
 
-Rust client library for submitting Solana transactions to Falcon receivers via QUIC.
+Rust client library for submitting Solana transactions to Falcon via QUIC.
 
 ## Installation
 
@@ -9,7 +9,7 @@ Rust client library for submitting Solana transactions to Falcon receivers via Q
 falcon-client = { git = "https://github.com/corvus-labs-io/falcon-client" }
 ```
 
-## Usage
+## Quick Start
 
 ```rust
 use falcon_client::FalconClient;
@@ -18,11 +18,9 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Connect to Falcon receiver
     let api_key = Uuid::parse_str("your-api-key-here")?;
-    let client = FalconClient::connect("fra.falcon.wtf:5001", api_key).await?;
+    let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
 
-    // Send a transaction
     let transaction: VersionedTransaction = /* your transaction */;
     client.send_transaction(&transaction).await?;
 
@@ -30,40 +28,33 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## API
+## How It Works
 
-### `FalconClient::connect(endpoint: &str, api_key: Uuid) -> Result<Self>`
+The client opens a QUIC connection from your application to Falcon. Transactions are serialized with bincode and sent over unidirectional QUIC streams — one stream per transaction.
 
-Establishes a QUIC connection to the Falcon receiver.
+Authentication uses mTLS: your API key is embedded in a self-signed client certificate, which Falcon validates on connection. No additional auth headers or tokens are needed after the initial handshake.
 
-- `endpoint` - Receiver address (e.g., `"host:5001"`)
-- `api_key` - Your API key for authentication
+If the connection drops, `send_transaction` reconnects automatically before retrying the send. Concurrent callers are coalesced — only one reconnect happens at a time.
 
-### `FalconClient::send_transaction(&self, tx: &VersionedTransaction) -> Result<()>`
+## Connection Parameters
 
-Sends a transaction to the receiver. Automatically reconnects on connection failure.
+All timeouts are compile-time constants:
 
-### `FalconClient::is_connected(&self) -> bool`
+| Parameter            | Value | Description                              |
+| -------------------- | ----- | ---------------------------------------- |
+| Keep-alive interval  | 25s   | QUIC keep-alive ping interval            |
+| Idle timeout         | 30s   | Connection closed after inactivity       |
+| Connect timeout      | 5s    | Initial connection timeout               |
+| Stream open timeout  | 200ms | Timeout for opening a unidirectional stream |
+| Write timeout        | 500ms | Transaction send timeout                 |
 
-Returns `true` if the QUIC connection is active.
+## Transport Details
 
-## Features
-
-- **QUIC transport** - Low-latency, multiplexed connections
-- **Auto-reconnect** - Transparent reconnection on connection loss
-- **Keep-alive** - Maintains connection with 25s keep-alive interval
-- **Async** - Built on Tokio for non-blocking I/O
-
-## Configuration
-
-Connection parameters (compile-time):
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Keep-alive interval | 25s | QUIC keep-alive ping interval |
-| Idle timeout | 30s | Connection closed after inactivity |
-| Connect timeout | 5s | Initial connection timeout |
-| Write timeout | 500ms | Transaction send timeout |
+- **Protocol**: QUIC via [quinn](https://docs.rs/quinn)
+- **TLS**: rustls with X25519 key exchange, client certificate authentication
+- **ALPN**: `falcon-tx`
+- **Serialization**: bincode
+- **Streams**: Unidirectional, one per transaction
 
 ## License
 
