@@ -247,9 +247,9 @@ async fn reconnect_happens_on_send_failure() {
 }
 
 fn create_dummy_transaction() -> VersionedTransaction {
+    use solana_message::Hash;
     use solana_message::VersionedMessage;
     use solana_message::legacy::Message as LegacyMessage;
-    use solana_message::Hash;
 
     let signature = Signature::from([1u8; 64]);
     let blockhash = Hash::from([2u8; 32]);

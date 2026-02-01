@@ -45,9 +45,11 @@ fn crypto_provider() -> CryptoProvider {
     provider
 }
 
-fn generate_server_cert() -> (CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>) {
-    let key_pair =
-        KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("keypair generation failed");
+fn generate_server_cert() -> (
+    CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+) {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("keypair generation failed");
 
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "falcon-test-server");
@@ -57,7 +59,9 @@ fn generate_server_cert() -> (CertificateDer<'static>, rustls::pki_types::Privat
     params.not_before = rcgen::date_time_ymd(1970, 1, 1);
     params.not_after = rcgen::date_time_ymd(4096, 1, 1);
 
-    let cert = params.self_signed(&key_pair).expect("cert generation failed");
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("cert generation failed");
 
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
@@ -149,9 +153,8 @@ pub fn build_mock_falcon_server(addr: SocketAddr) -> Endpoint {
 
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    transport.max_idle_timeout(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok(),
-    );
+    transport
+        .max_idle_timeout(quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok());
     server_config.transport_config(Arc::new(transport));
 
     Endpoint::server(server_config, addr).expect("server endpoint")

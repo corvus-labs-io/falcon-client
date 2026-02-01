@@ -1,19 +1,20 @@
 use {
     core::mem::MaybeUninit,
+    solana_message::Hash,
     solana_message::{
-        MessageHeader, VersionedMessage,
-        compiled_instruction::CompiledInstruction,
+        MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
         v0::MessageAddressTableLookup,
     },
-    solana_message::Hash,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
     wincode::{
-        SchemaRead, SchemaWrite, containers,
-        error::{ReadResult, WriteResult, invalid_tag_encoding},
+        SchemaRead, SchemaWrite,
+        config::Config,
+        containers,
+        error::{ReadResult, WriteError, WriteResult, invalid_tag_encoding},
         io::{Reader, Writer},
-        len::ShortU16Len,
+        len::ShortU16,
     },
     wincode_derive::{SchemaRead as DeriveRead, SchemaWrite as DeriveWrite},
 };
@@ -30,7 +31,7 @@ pub fn deserialize_transaction(bytes: &[u8]) -> ReadResult<VersionedTransaction>
 
 #[derive(DeriveRead, DeriveWrite)]
 struct WincodeVersionedTransaction {
-    #[wincode(with = "containers::Vec<WincodeSignature, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<WincodeSignature, ShortU16>")]
     signatures: Vec<WincodeSignature>,
     message: WincodeVersionedMessage,
 }
@@ -68,18 +69,18 @@ enum WincodeVersionedMessage {
     V0(WincodeV0Message),
 }
 
-impl<'de> SchemaRead<'de> for WincodeVersionedMessage {
+unsafe impl<'de, C: Config> SchemaRead<'de, C> for WincodeVersionedMessage {
     type Dst = Self;
 
     fn read(reader: &mut impl Reader<'de>, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
         let first_byte = *reader.peek()?;
 
         if first_byte < 0x80 {
-            let msg = WincodeLegacyMessage::get(reader)?;
+            let msg = <WincodeLegacyMessage as SchemaRead<'de, C>>::get(reader)?;
             dst.write(WincodeVersionedMessage::Legacy(msg));
         } else if first_byte == 0x80 {
             reader.consume(1)?;
-            let msg = WincodeV0Message::get(reader)?;
+            let msg = <WincodeV0Message as SchemaRead<'de, C>>::get(reader)?;
             dst.write(WincodeVersionedMessage::V0(msg));
         } else {
             return Err(invalid_tag_encoding(first_byte as usize));
@@ -88,22 +89,31 @@ impl<'de> SchemaRead<'de> for WincodeVersionedMessage {
     }
 }
 
-impl SchemaWrite for WincodeVersionedMessage {
+unsafe impl<C: Config> SchemaWrite<C> for WincodeVersionedMessage {
     type Src = Self;
 
     fn size_of(src: &Self::Src) -> WriteResult<usize> {
         match src {
-            WincodeVersionedMessage::Legacy(msg) => WincodeLegacyMessage::size_of(msg),
-            WincodeVersionedMessage::V0(msg) => Ok(1 + WincodeV0Message::size_of(msg)?),
+            WincodeVersionedMessage::Legacy(msg) => {
+                <WincodeLegacyMessage as SchemaWrite<C>>::size_of(msg)
+            }
+            WincodeVersionedMessage::V0(msg) => {
+                let inner = <WincodeV0Message as SchemaWrite<C>>::size_of(msg)?;
+                inner
+                    .checked_add(1)
+                    .ok_or(WriteError::Custom("v0 message size overflow"))
+            }
         }
     }
 
     fn write(writer: &mut impl Writer, src: &Self::Src) -> WriteResult<()> {
         match src {
-            WincodeVersionedMessage::Legacy(msg) => WincodeLegacyMessage::write(writer, msg),
+            WincodeVersionedMessage::Legacy(msg) => {
+                <WincodeLegacyMessage as SchemaWrite<C>>::write(writer, msg)
+            }
             WincodeVersionedMessage::V0(msg) => {
-                u8::write(writer, &0x80)?;
-                WincodeV0Message::write(writer, msg)
+                <u8 as SchemaWrite<C>>::write(writer, &0x80)?;
+                <WincodeV0Message as SchemaWrite<C>>::write(writer, msg)
             }
         }
     }
@@ -132,10 +142,10 @@ impl From<&VersionedMessage> for WincodeVersionedMessage {
 #[derive(DeriveRead, DeriveWrite)]
 struct WincodeLegacyMessage {
     header: WincodeMessageHeader,
-    #[wincode(with = "containers::Vec<WincodePubkey, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<WincodePubkey, ShortU16>")]
     account_keys: Vec<WincodePubkey>,
     recent_blockhash: WincodeHash,
-    #[wincode(with = "containers::Vec<WincodeCompiledInstruction, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<WincodeCompiledInstruction, ShortU16>")]
     instructions: Vec<WincodeCompiledInstruction>,
 }
 
@@ -168,12 +178,12 @@ impl From<&solana_message::Message> for WincodeLegacyMessage {
 #[derive(DeriveRead, DeriveWrite)]
 struct WincodeV0Message {
     header: WincodeMessageHeader,
-    #[wincode(with = "containers::Vec<WincodePubkey, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<WincodePubkey, ShortU16>")]
     account_keys: Vec<WincodePubkey>,
     recent_blockhash: WincodeHash,
-    #[wincode(with = "containers::Vec<WincodeCompiledInstruction, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<WincodeCompiledInstruction, ShortU16>")]
     instructions: Vec<WincodeCompiledInstruction>,
-    #[wincode(with = "containers::Vec<WincodeAddressTableLookup, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<WincodeAddressTableLookup, ShortU16>")]
     address_table_lookups: Vec<WincodeAddressTableLookup>,
 }
 
@@ -273,9 +283,9 @@ impl From<&Hash> for WincodeHash {
 #[derive(DeriveRead, DeriveWrite)]
 struct WincodeCompiledInstruction {
     program_id_index: u8,
-    #[wincode(with = "containers::Vec<u8, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<u8, ShortU16>")]
     accounts: Vec<u8>,
-    #[wincode(with = "containers::Vec<u8, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<u8, ShortU16>")]
     data: Vec<u8>,
 }
 
@@ -302,9 +312,9 @@ impl From<&CompiledInstruction> for WincodeCompiledInstruction {
 #[derive(DeriveRead, DeriveWrite)]
 struct WincodeAddressTableLookup {
     account_key: WincodePubkey,
-    #[wincode(with = "containers::Vec<u8, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<u8, ShortU16>")]
     writable_indexes: Vec<u8>,
-    #[wincode(with = "containers::Vec<u8, ShortU16Len>")]
+    #[wincode(with = "containers::Vec<u8, ShortU16>")]
     readonly_indexes: Vec<u8>,
 }
 
@@ -325,5 +335,137 @@ impl From<&MessageAddressTableLookup> for WincodeAddressTableLookup {
             writable_indexes: l.writable_indexes.clone(),
             readonly_indexes: l.readonly_indexes.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal legacy transaction with deterministic data.
+    fn legacy_transaction() -> VersionedTransaction {
+        VersionedTransaction {
+            signatures: vec![Signature::from([0x01; 64])],
+            message: VersionedMessage::Legacy(solana_message::Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 0,
+                },
+                account_keys: vec![Pubkey::from([0x03; 32])],
+                recent_blockhash: Hash::from([0x02; 32]),
+                instructions: vec![],
+            }),
+        }
+    }
+
+    /// Build a v0 transaction with an instruction and address table lookup.
+    fn v0_transaction() -> VersionedTransaction {
+        VersionedTransaction {
+            signatures: vec![Signature::from([0x04; 64])],
+            message: VersionedMessage::V0(solana_message::v0::Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                account_keys: vec![Pubkey::from([0x05; 32]), Pubkey::from([0x06; 32])],
+                recent_blockhash: Hash::from([0x07; 32]),
+                instructions: vec![CompiledInstruction {
+                    program_id_index: 0,
+                    accounts: vec![1],
+                    data: vec![0xAB, 0xCD],
+                }],
+                address_table_lookups: vec![MessageAddressTableLookup {
+                    account_key: Pubkey::from([0x08; 32]),
+                    writable_indexes: vec![0],
+                    readonly_indexes: vec![1, 2],
+                }],
+            }),
+        }
+    }
+
+    fn assert_transactions_equal(a: &VersionedTransaction, b: &VersionedTransaction) {
+        assert_eq!(a.signatures, b.signatures, "signatures mismatch");
+
+        let a_keys = a.message.static_account_keys();
+        let b_keys = b.message.static_account_keys();
+        assert_eq!(a_keys, b_keys, "account_keys mismatch");
+
+        let a_hash = a.message.recent_blockhash();
+        let b_hash = b.message.recent_blockhash();
+        assert_eq!(a_hash, b_hash, "recent_blockhash mismatch");
+
+        assert_eq!(
+            a.message.instructions(),
+            b.message.instructions(),
+            "instructions mismatch"
+        );
+
+        assert_eq!(
+            a.message.address_table_lookups(),
+            b.message.address_table_lookups(),
+            "address_table_lookups mismatch"
+        );
+    }
+
+    // -- Round-trip tests --
+
+    #[test]
+    fn legacy_transaction_wincode_roundtrip() {
+        let tx = legacy_transaction();
+        let bytes = serialize_transaction(&tx).expect("serialize");
+        let deserialized = deserialize_transaction(&bytes).expect("deserialize");
+        assert_transactions_equal(&tx, &deserialized);
+    }
+
+    #[test]
+    fn v0_transaction_wincode_roundtrip() {
+        let tx = v0_transaction();
+        let bytes = serialize_transaction(&tx).expect("serialize");
+        let deserialized = deserialize_transaction(&bytes).expect("deserialize");
+        assert_transactions_equal(&tx, &deserialized);
+    }
+
+    // -- Golden-vector tests: wincode output must match bincode byte-for-byte --
+
+    #[test]
+    fn legacy_transaction_wincode_matches_bincode() {
+        let tx = legacy_transaction();
+        let wincode_bytes = serialize_transaction(&tx).expect("wincode serialize");
+        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
+        assert_eq!(
+            wincode_bytes, bincode_bytes,
+            "wincode and bincode must produce identical bytes for legacy transactions"
+        );
+    }
+
+    #[test]
+    fn v0_transaction_wincode_matches_bincode() {
+        let tx = v0_transaction();
+        let wincode_bytes = serialize_transaction(&tx).expect("wincode serialize");
+        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
+        assert_eq!(
+            wincode_bytes, bincode_bytes,
+            "wincode and bincode must produce identical bytes for v0 transactions"
+        );
+    }
+
+    // -- Cross-deserialize: wincode can deserialize bincode output --
+
+    #[test]
+    fn legacy_transaction_wincode_deserializes_bincode_bytes() {
+        let tx = legacy_transaction();
+        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
+        let deserialized = deserialize_transaction(&bincode_bytes).expect("deserialize");
+        assert_transactions_equal(&tx, &deserialized);
+    }
+
+    #[test]
+    fn v0_transaction_wincode_deserializes_bincode_bytes() {
+        let tx = v0_transaction();
+        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
+        let deserialized = deserialize_transaction(&bincode_bytes).expect("deserialize");
+        assert_transactions_equal(&tx, &deserialized);
     }
 }
