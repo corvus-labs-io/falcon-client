@@ -18,11 +18,13 @@
 //! ```
 
 mod tls;
+mod wire;
+
+pub use wire::{deserialize_transaction, serialize_transaction};
 
 use {
     anyhow::{Context, Result, anyhow},
     arc_swap::ArcSwap,
-    tls::{SkipServerVerification, crypto_provider},
     quinn::{
         ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
         crypto::rustls::QuicClientConfig,
@@ -30,6 +32,7 @@ use {
     rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair},
     solana_transaction::versioned::VersionedTransaction,
     std::{net::SocketAddr, sync::Arc, time::Duration},
+    tls::{SkipServerVerification, crypto_provider},
     tokio::sync::Mutex,
     tracing::warn,
     uuid::Uuid,
@@ -150,11 +153,12 @@ impl FalconClient {
 
     /// Serializes and sends a transaction to Falcon.
     ///
-    /// The transaction is bincode-encoded and written to a new unidirectional
+    /// The transaction is wincode-encoded and written to a new unidirectional
     /// QUIC stream. If the first attempt fails, the connection is
     /// re-established and the send is retried once.
     pub async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<()> {
-        let payload = bincode::serialize(transaction)?;
+        let payload = wire::serialize_transaction(transaction)
+            .map_err(|e| anyhow!("wincode serialize failed: {e}"))?;
 
         let connection = self.connection.load_full();
         if Self::try_send(&connection, &payload).await.is_ok() {

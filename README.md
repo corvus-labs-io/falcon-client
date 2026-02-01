@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## How It Works
 
-The client opens a QUIC connection from your application to Falcon. Transactions are serialized with bincode and sent over unidirectional QUIC streams — one stream per transaction.
+The client opens a QUIC connection from your application to Falcon. Transactions are serialized with wincode and sent over unidirectional QUIC streams — one stream per transaction.
 
 Authentication uses mTLS: your API key is embedded in a self-signed client certificate, which Falcon validates on connection. No additional auth headers or tokens are needed after the initial handshake.
 
@@ -56,7 +56,7 @@ All timeouts are compile-time constants:
 - **Protocol**: QUIC via [quinn](https://docs.rs/quinn)
 - **TLS**: rustls with X25519 key exchange, client certificate authentication
 - **ALPN**: `falcon-tx`
-- **Serialization**: bincode
+- **Serialization**: wincode
 - **Streams**: Unidirectional, one per transaction
 
 ## License

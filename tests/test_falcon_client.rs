@@ -153,7 +153,7 @@ async fn send_transaction_to_accepting_server() {
     assert!(!received_data.is_empty());
 
     let deserialized: VersionedTransaction =
-        bincode::deserialize(&received_data).expect("deserialize");
+        falcon_client::deserialize_transaction(&received_data).expect("deserialize");
     assert_eq!(deserialized.signatures, transaction.signatures);
 
     server_handle.abort();
@@ -249,7 +249,7 @@ async fn reconnect_happens_on_send_failure() {
 fn create_dummy_transaction() -> VersionedTransaction {
     use solana_message::VersionedMessage;
     use solana_message::legacy::Message as LegacyMessage;
-    use solana_transaction::Hash;
+    use solana_message::Hash;
 
     let signature = Signature::from([1u8; 64]);
     let blockhash = Hash::from([2u8; 32]);
