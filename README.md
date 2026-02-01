@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let api_key = Uuid::parse_str("your-api-key-here")?;
     
     // FalconClient::connect binds to an ephemeral port. 
-    // FalconClient::connect_with_bind specifies the static inbound peer port/
+    // FalconClient::connect_with_bind specifies the static inbound peer port
     let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
 
     let transaction: VersionedTransaction = /* your transaction */;
