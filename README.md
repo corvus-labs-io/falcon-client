@@ -20,7 +20,7 @@ use uuid::Uuid;
 async fn main() -> anyhow::Result<()> {
     // Connect to Falcon receiver
     let api_key = Uuid::parse_str("your-api-key-here")?;
-    let client = FalconClient::connect("falcon.example.com:5001", api_key).await?;
+    let client = FalconClient::connect("fra.falcon.wtf:5001", api_key).await?;
 
     // Send a transaction
     let transaction: VersionedTransaction = /* your transaction */;

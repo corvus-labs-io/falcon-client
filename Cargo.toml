@@ -6,7 +6,7 @@ homepage    = "https://falcon.wtf"
 license     = "Apache-2.0"
 name        = "falcon-client"
 repository  = "https://github.com/corvus-labs-io/falcon-client"
-version     = "0.0.1"
+version     = "0.0.2"
 
 [dependencies]
 anyhow    = "1"
