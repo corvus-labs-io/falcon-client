@@ -85,12 +85,22 @@ pub struct FalconClient {
 }
 
 impl FalconClient {
-    /// Opens a QUIC connection to Falcon.
-    ///
-    /// Resolves `endpoint_addr` via DNS, generates a self-signed client
-    /// certificate with `api_key` as the Common Name, and establishes the
-    /// QUIC session. Times out after 5 seconds.
+    /// Opens a QUIC connection to Falcon, binding the local socket to an
+    /// ephemeral port.
     pub async fn connect(endpoint_addr: &str, api_key: Uuid) -> Result<Self> {
+        Self::connect_with_bind(endpoint_addr, api_key, "0.0.0.0:0".parse()?).await
+    }
+
+    /// Opens a QUIC connection to Falcon, binding the local socket to
+    /// `local_addr`.
+    ///
+    /// Use a fixed port (e.g. `0.0.0.0:5002`) when a firewall rule must
+    /// allow inbound UDP responses from the server.
+    pub async fn connect_with_bind(
+        endpoint_addr: &str,
+        api_key: Uuid,
+        local_addr: SocketAddr,
+    ) -> Result<Self> {
         let (cert, key) = generate_client_cert(api_key)?;
 
         let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
@@ -115,7 +125,7 @@ impl FalconClient {
         let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
         client_config.transport_config(Arc::new(transport));
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+        let mut endpoint = Endpoint::client(local_addr)?;
         endpoint.set_default_client_config(client_config.clone());
 
         let addr = tokio::net::lookup_host(endpoint_addr)

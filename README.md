@@ -19,6 +19,9 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let api_key = Uuid::parse_str("your-api-key-here")?;
+    
+    // FalconClient::connect binds to an ephemeral port. 
+    // FalconClient::connect_with_bind specifies the static inbound peer port/
     let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
 
     let transaction: VersionedTransaction = /* your transaction */;
@@ -40,13 +43,13 @@ If the connection drops, `send_transaction` reconnects automatically before retr
 
 All timeouts are compile-time constants:
 
-| Parameter            | Value | Description                              |
-| -------------------- | ----- | ---------------------------------------- |
-| Keep-alive interval  | 25s   | QUIC keep-alive ping interval            |
-| Idle timeout         | 30s   | Connection closed after inactivity       |
-| Connect timeout      | 5s    | Initial connection timeout               |
-| Stream open timeout  | 200ms | Timeout for opening a unidirectional stream |
-| Write timeout        | 500ms | Transaction send timeout                 |
+| Parameter           | Value | Description                                 |
+| ------------------- | ----- | ------------------------------------------- |
+| Keep-alive interval | 25s   | QUIC keep-alive ping interval               |
+| Idle timeout        | 30s   | Connection closed after inactivity          |
+| Connect timeout     | 5s    | Initial connection timeout                  |
+| Stream open timeout | 200ms | Timeout for opening a unidirectional stream |
+| Write timeout       | 500ms | Transaction send timeout                    |
 
 ## Transport Details
 
