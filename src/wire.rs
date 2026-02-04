@@ -55,6 +55,8 @@ impl From<&VersionedTransaction> for WincodeVersionedTransaction {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(transparent)]
+#[wincode(assert_zero_copy)]
 struct WincodeSignature(#[wincode(with = "[u8; 64]")] [u8; 64]);
 
 impl From<&Signature> for WincodeSignature {
@@ -224,6 +226,8 @@ impl From<&solana_message::v0::Message> for WincodeV0Message {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(C)]
+#[wincode(assert_zero_copy)]
 struct WincodeMessageHeader {
     num_required_signatures: u8,
     num_readonly_signed_accounts: u8,
@@ -251,6 +255,8 @@ impl From<&MessageHeader> for WincodeMessageHeader {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(transparent)]
+#[wincode(assert_zero_copy)]
 struct WincodePubkey(#[wincode(with = "[u8; 32]")] [u8; 32]);
 
 impl From<WincodePubkey> for Pubkey {
@@ -266,6 +272,8 @@ impl From<&Pubkey> for WincodePubkey {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(transparent)]
+#[wincode(assert_zero_copy)]
 struct WincodeHash(#[wincode(with = "[u8; 32]")] [u8; 32]);
 
 impl From<WincodeHash> for Hash {
