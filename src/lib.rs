@@ -161,14 +161,15 @@ impl FalconClient {
     pub async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<()> {
         let payload = wire::serialize_transaction(transaction)
             .map_err(|e| anyhow!("wincode serialize failed: {e}"))?;
+        self.send_transaction_payload(&payload).await
+    }
 
-        if self.try_send(&payload).await.is_ok() {
-            return Ok(());
-        }
-
+    #[inline]
+    pub async fn send_transaction_payload(&self, payload: &[u8]) -> Result<()> {
+        self.try_send(payload).await?;
         warn!("send failed, reconnecting");
         self.reconnect(true).await?;
-        self.try_send(&payload).await
+        self.try_send(payload).await
     }
 
     async fn try_send(&self, payload: &[u8]) -> Result<()> {
