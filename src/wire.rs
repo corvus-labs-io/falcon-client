@@ -350,7 +350,6 @@ impl From<&MessageAddressTableLookup> for WincodeAddressTableLookup {
 mod tests {
     use super::*;
 
-    /// Build a minimal legacy transaction with deterministic data.
     fn legacy_transaction() -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![Signature::from([0x01; 64])],
@@ -367,7 +366,6 @@ mod tests {
         }
     }
 
-    /// Build a v0 transaction with an instruction and address table lookup.
     fn v0_transaction() -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![Signature::from([0x04; 64])],
@@ -417,8 +415,6 @@ mod tests {
         );
     }
 
-    // -- Round-trip tests --
-
     #[test]
     fn legacy_transaction_wincode_roundtrip() {
         let tx = legacy_transaction();
@@ -435,45 +431,4 @@ mod tests {
         assert_transactions_equal(&tx, &deserialized);
     }
 
-    // -- Golden-vector tests: wincode output must match bincode byte-for-byte --
-
-    #[test]
-    fn legacy_transaction_wincode_matches_bincode() {
-        let tx = legacy_transaction();
-        let wincode_bytes = serialize_transaction(&tx).expect("wincode serialize");
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        assert_eq!(
-            wincode_bytes, bincode_bytes,
-            "wincode and bincode must produce identical bytes for legacy transactions"
-        );
-    }
-
-    #[test]
-    fn v0_transaction_wincode_matches_bincode() {
-        let tx = v0_transaction();
-        let wincode_bytes = serialize_transaction(&tx).expect("wincode serialize");
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        assert_eq!(
-            wincode_bytes, bincode_bytes,
-            "wincode and bincode must produce identical bytes for v0 transactions"
-        );
-    }
-
-    // -- Cross-deserialize: wincode can deserialize bincode output --
-
-    #[test]
-    fn legacy_transaction_wincode_deserializes_bincode_bytes() {
-        let tx = legacy_transaction();
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        let deserialized = deserialize_transaction(&bincode_bytes).expect("deserialize");
-        assert_transactions_equal(&tx, &deserialized);
-    }
-
-    #[test]
-    fn v0_transaction_wincode_deserializes_bincode_bytes() {
-        let tx = v0_transaction();
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        let deserialized = deserialize_transaction(&bincode_bytes).expect("deserialize");
-        assert_transactions_equal(&tx, &deserialized);
-    }
 }

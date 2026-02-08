@@ -108,7 +108,6 @@ mod tests {
     fn crypto_provider_only_enables_x25519() {
         let provider = crypto_provider();
 
-        // Should have exactly one key exchange group: X25519
         assert_eq!(provider.kx_groups.len(), 1);
         assert_eq!(provider.kx_groups[0].name(), NamedGroup::X25519);
     }
@@ -117,7 +116,6 @@ mod tests {
     fn crypto_provider_has_signature_algorithms() {
         let provider = crypto_provider();
 
-        // Should have signature verification algorithms configured
         assert!(
             !provider
                 .signature_verification_algorithms
@@ -130,7 +128,6 @@ mod tests {
     fn skip_server_verification_new_returns_arc() {
         let verifier = SkipServerVerification::new();
 
-        // Verify it returns an Arc
         assert_eq!(Arc::strong_count(&verifier), 1);
     }
 
@@ -138,7 +135,6 @@ mod tests {
     fn skip_server_verification_default_trait() {
         let verifier = SkipServerVerification::default();
 
-        // Should have signature verification schemes
         assert!(!verifier.supported_verify_schemes().is_empty());
     }
 
@@ -148,9 +144,7 @@ mod tests {
 
         let schemes = verifier.supported_verify_schemes();
 
-        // Should support common signature schemes
         assert!(!schemes.is_empty());
-        // ED25519 is commonly used in Solana
         assert!(schemes.contains(&SignatureScheme::ED25519));
     }
 
@@ -160,14 +154,12 @@ mod tests {
 
         let verifier = SkipServerVerification::new();
 
-        // Create a dummy certificate (empty is fine since verification is skipped)
         let cert = CertificateDer::from(vec![0u8; 32]);
         let server_name = ServerName::try_from("test.example.com").unwrap();
         let now = UnixTime::now();
 
         let result = verifier.verify_server_cert(&cert, &[], &server_name, &[], now);
 
-        // Should always succeed since we skip certificate validation
         assert!(result.is_ok());
     }
 
