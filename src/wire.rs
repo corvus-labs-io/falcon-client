@@ -430,5 +430,4 @@ mod tests {
         let deserialized = deserialize_transaction(&bytes).expect("deserialize");
         assert_transactions_equal(&tx, &deserialized);
     }
-
 }
