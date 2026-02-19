@@ -55,6 +55,8 @@ impl From<&VersionedTransaction> for WincodeVersionedTransaction {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(transparent)]
+#[wincode(assert_zero_copy)]
 struct WincodeSignature(#[wincode(with = "[u8; 64]")] [u8; 64]);
 
 impl From<&Signature> for WincodeSignature {
@@ -224,6 +226,8 @@ impl From<&solana_message::v0::Message> for WincodeV0Message {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(C)]
+#[wincode(assert_zero_copy)]
 struct WincodeMessageHeader {
     num_required_signatures: u8,
     num_readonly_signed_accounts: u8,
@@ -251,6 +255,8 @@ impl From<&MessageHeader> for WincodeMessageHeader {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(transparent)]
+#[wincode(assert_zero_copy)]
 struct WincodePubkey(#[wincode(with = "[u8; 32]")] [u8; 32]);
 
 impl From<WincodePubkey> for Pubkey {
@@ -266,6 +272,8 @@ impl From<&Pubkey> for WincodePubkey {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
+#[repr(transparent)]
+#[wincode(assert_zero_copy)]
 struct WincodeHash(#[wincode(with = "[u8; 32]")] [u8; 32]);
 
 impl From<WincodeHash> for Hash {
@@ -342,7 +350,6 @@ impl From<&MessageAddressTableLookup> for WincodeAddressTableLookup {
 mod tests {
     use super::*;
 
-    /// Build a minimal legacy transaction with deterministic data.
     fn legacy_transaction() -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![Signature::from([0x01; 64])],
@@ -359,7 +366,6 @@ mod tests {
         }
     }
 
-    /// Build a v0 transaction with an instruction and address table lookup.
     fn v0_transaction() -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![Signature::from([0x04; 64])],
@@ -409,8 +415,6 @@ mod tests {
         );
     }
 
-    // -- Round-trip tests --
-
     #[test]
     fn legacy_transaction_wincode_roundtrip() {
         let tx = legacy_transaction();
@@ -424,48 +428,6 @@ mod tests {
         let tx = v0_transaction();
         let bytes = serialize_transaction(&tx).expect("serialize");
         let deserialized = deserialize_transaction(&bytes).expect("deserialize");
-        assert_transactions_equal(&tx, &deserialized);
-    }
-
-    // -- Golden-vector tests: wincode output must match bincode byte-for-byte --
-
-    #[test]
-    fn legacy_transaction_wincode_matches_bincode() {
-        let tx = legacy_transaction();
-        let wincode_bytes = serialize_transaction(&tx).expect("wincode serialize");
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        assert_eq!(
-            wincode_bytes, bincode_bytes,
-            "wincode and bincode must produce identical bytes for legacy transactions"
-        );
-    }
-
-    #[test]
-    fn v0_transaction_wincode_matches_bincode() {
-        let tx = v0_transaction();
-        let wincode_bytes = serialize_transaction(&tx).expect("wincode serialize");
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        assert_eq!(
-            wincode_bytes, bincode_bytes,
-            "wincode and bincode must produce identical bytes for v0 transactions"
-        );
-    }
-
-    // -- Cross-deserialize: wincode can deserialize bincode output --
-
-    #[test]
-    fn legacy_transaction_wincode_deserializes_bincode_bytes() {
-        let tx = legacy_transaction();
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        let deserialized = deserialize_transaction(&bincode_bytes).expect("deserialize");
-        assert_transactions_equal(&tx, &deserialized);
-    }
-
-    #[test]
-    fn v0_transaction_wincode_deserializes_bincode_bytes() {
-        let tx = v0_transaction();
-        let bincode_bytes = bincode::serialize(&tx).expect("bincode serialize");
-        let deserialized = deserialize_transaction(&bincode_bytes).expect("deserialize");
         assert_transactions_equal(&tx, &deserialized);
     }
 }

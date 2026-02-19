@@ -85,6 +85,7 @@ pub struct FalconClient {
     addr: SocketAddr,
     connection: ArcSwap<Connection>,
     reconnect: Mutex<()>,
+    write_timeout: Duration,
 }
 
 impl FalconClient {
@@ -148,6 +149,7 @@ impl FalconClient {
             addr,
             connection: ArcSwap::from_pointee(connection),
             reconnect: Mutex::new(()),
+            write_timeout: WRITE_TIMEOUT,
         })
     }
 
@@ -159,25 +161,27 @@ impl FalconClient {
     pub async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<()> {
         let payload = wire::serialize_transaction(transaction)
             .map_err(|e| anyhow!("wincode serialize failed: {e}"))?;
+        self.send_transaction_payload(&payload).await
+    }
 
-        let connection = self.connection.load_full();
-        if Self::try_send(&connection, &payload).await.is_ok() {
+    #[inline]
+    pub async fn send_transaction_payload(&self, payload: &[u8]) -> Result<()> {
+        if self.try_send(payload).await.is_ok() {
             return Ok(());
         }
 
         warn!("send failed, reconnecting");
         self.reconnect(true).await?;
-
-        let connection = self.connection.load_full();
-        Self::try_send(&connection, &payload).await
+        self.try_send(payload).await
     }
 
-    async fn try_send(connection: &Connection, payload: &[u8]) -> Result<()> {
-        let mut stream = tokio::time::timeout(OPEN_STREAM_TIMEOUT, connection.open_uni())
-            .await
-            .context("open_uni timeout")??;
+    async fn try_send(&self, payload: &[u8]) -> Result<()> {
+        let mut stream =
+            tokio::time::timeout(OPEN_STREAM_TIMEOUT, self.connection.load().open_uni())
+                .await
+                .context("open_uni timeout")??;
 
-        tokio::time::timeout(WRITE_TIMEOUT, async {
+        tokio::time::timeout(self.write_timeout, async {
             stream.write_all(payload).await?;
             stream.finish()?;
             Ok::<_, anyhow::Error>(())
@@ -212,6 +216,10 @@ impl FalconClient {
 
         self.connection.store(Arc::new(connection));
         Ok(())
+    }
+
+    pub fn set_write_timeout(&mut self, write_timeout: Duration) {
+        self.write_timeout = write_timeout;
     }
 
     /// Returns `true` if the QUIC connection is active.
