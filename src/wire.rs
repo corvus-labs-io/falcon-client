@@ -19,11 +19,17 @@ use {
     wincode_derive::{SchemaRead as DeriveRead, SchemaWrite as DeriveWrite},
 };
 
+/// Serializes a [`VersionedTransaction`] into wincode wire format.
+///
+/// Returns the raw bytes ready to send over the QUIC stream or datagram.
 pub fn serialize_transaction(tx: &VersionedTransaction) -> WriteResult<Vec<u8>> {
     let wrapper = WincodeVersionedTransaction::from(tx);
     wincode::serialize(&wrapper)
 }
 
+/// Deserializes a [`VersionedTransaction`] from wincode wire format.
+///
+/// Accepts bytes previously produced by [`serialize_transaction`].
 pub fn deserialize_transaction(bytes: &[u8]) -> ReadResult<VersionedTransaction> {
     let wrapper: WincodeVersionedTransaction = wincode::deserialize(bytes)?;
     Ok(wrapper.into())

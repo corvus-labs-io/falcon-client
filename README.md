@@ -81,6 +81,39 @@ client.set_transport_mode(TransportMode::Datagram);
 client.send_transaction(&tx).await?;
 ```
 
+## Debug Mode (Opt-in)
+
+Opt-in real-time event stream showing how your transactions are being processed server-side.
+
+```rust
+let mut rx = client.subscribe_debug().await?;
+
+// Receive events in a background task or loop
+tokio::spawn(async move {
+    while let Some(event) = rx.recv().await {
+        println!("seq={} kind={:?}", event.sequence, event.kind);
+    }
+});
+
+// Later, unsubscribe without closing the connection
+client.unsubscribe_debug().await?;
+```
+
+| Event | Fields | Meaning |
+|-------|--------|---------|
+| ValidationOk | signature | Transaction passed validation |
+| ValidationErr | signature, reason | Validation failed |
+| ForwardOk | signature, latencies, bridges, failover | Forwarded to network |
+| ForwardErr | signature, reason | Forward failed |
+| EventsDropped | count | Debug channel was full, events lost |
+| Subscribed | — | Subscription confirmed |
+| Unsubscribed | — | Unsubscription confirmed |
+
+* Sequence numbers are monotonic per connection, gaps indicate dropped events.
+* Debug mode has zero impact on transaction processing (non-blocking).
+* Only one active subscription per connection, call `unsubscribe_debug` before re-subscribing.
+
+
 ## Connection Parameters
 
 | Parameter | Value | Description |

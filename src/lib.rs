@@ -26,15 +26,23 @@
 //! # Ok(())
 //! # }
 //! ```
+//! # Debug mode
+//!
+//! Call [`FalconClient::subscribe_debug`] to receive real-time processing
+//! events for your transactions. See [`DebugEvent`] for event types.
+//!
 
+mod debug;
 mod tls;
 mod wire;
 
+pub use debug::{DebugEvent, DebugEventKind};
 pub use wire::{deserialize_transaction, serialize_transaction};
 
 use {
     anyhow::{Context, Result, anyhow},
     arc_swap::ArcSwap,
+    debug::{CONTROL_SUBSCRIBE, CONTROL_UNSUBSCRIBE, MAX_DEBUG_EVENT_SIZE, STREAM_PREFIX_CONTROL},
     quinn::{
         ClientConfig, Connection, Endpoint, IdleTimeout, SendDatagramError, TransportConfig,
         crypto::rustls::QuicClientConfig,
@@ -55,6 +63,7 @@ const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const INITIAL_MTU: u16 = 1472;
+const DEBUG_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Selects how transactions are delivered over the QUIC connection.
 ///
@@ -136,6 +145,7 @@ pub struct FalconClient {
     reconnect: Mutex<()>,
     transport_mode: TransportMode,
     send_timeout: Duration,
+    debug_listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl FalconClient {
@@ -203,6 +213,7 @@ impl FalconClient {
             reconnect: Mutex::new(()),
             transport_mode: TransportMode::default(),
             send_timeout: SEND_TIMEOUT,
+            debug_listener: Mutex::new(None),
         })
     }
 
@@ -316,6 +327,123 @@ impl FalconClient {
     /// Returns `true` if the QUIC connection is active.
     pub fn is_connected(&self) -> bool {
         self.connection.load().close_reason().is_none()
+    }
+
+    /// Subscribes to real-time debug events for this connection.
+    ///
+    /// Returns a channel receiver that yields [`DebugEvent`] values as the
+    /// server processes your transactions. Only one subscription is active
+    /// at a time — call [`unsubscribe_debug`](Self::unsubscribe_debug) first
+    /// to re-subscribe.
+    ///
+    /// The debug stream has no impact on transaction processing performance.
+    pub async fn subscribe_debug(&self) -> Result<tokio::sync::mpsc::Receiver<DebugEvent>> {
+        {
+            let guard = self.debug_listener.lock().await;
+            if guard.is_some() {
+                anyhow::bail!("already subscribed to debug events — call unsubscribe_debug first");
+            }
+        }
+
+        let conn = self.connection.load_full();
+        tokio::time::timeout(DEBUG_CONTROL_TIMEOUT, async {
+            let mut control_stream = conn
+                .open_uni()
+                .await
+                .context("failed to open control stream")?;
+            control_stream
+                .write_all(&[STREAM_PREFIX_CONTROL, CONTROL_SUBSCRIBE])
+                .await
+                .context("failed to send subscribe")?;
+            control_stream
+                .finish()
+                .context("failed to finish control stream")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("subscribe control timeout")??;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+
+        let handle = tokio::spawn(async move {
+            let Ok(recv) = conn.accept_uni().await else {
+                return;
+            };
+            read_debug_stream(recv, tx).await;
+        });
+
+        *self.debug_listener.lock().await = Some(handle);
+        Ok(rx)
+    }
+
+    /// Unsubscribes from debug events without closing the connection.
+    ///
+    /// Sends an unsubscribe control message, waits briefly for the server
+    /// to deliver a final [`DebugEventKind::Unsubscribed`] event, then
+    /// tears down the listener. Transaction flow is unaffected.
+    pub async fn unsubscribe_debug(&self) -> Result<()> {
+        // Send control unsubscribe first so server can deliver Unsubscribed event
+        let conn = self.connection.load();
+        let send_result = tokio::time::timeout(DEBUG_CONTROL_TIMEOUT, async {
+            let mut control_stream = conn
+                .open_uni()
+                .await
+                .context("failed to open control stream")?;
+            control_stream
+                .write_all(&[STREAM_PREFIX_CONTROL, CONTROL_UNSUBSCRIBE])
+                .await
+                .context("failed to send unsubscribe")?;
+            control_stream
+                .finish()
+                .context("failed to finish control stream")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("unsubscribe control timeout")?;
+
+        // Wait briefly for listener to receive Unsubscribed event, then abort as fallback
+        {
+            let mut guard = self.debug_listener.lock().await;
+            if let Some(handle) = guard.take() {
+                let abort = handle.abort_handle();
+                if tokio::time::timeout(Duration::from_millis(200), handle)
+                    .await
+                    .is_err()
+                {
+                    abort.abort();
+                }
+            }
+        }
+
+        send_result
+    }
+}
+
+async fn read_debug_stream(
+    mut recv: quinn::RecvStream,
+    tx: tokio::sync::mpsc::Sender<DebugEvent>,
+) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if recv.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let frame_len = u32::from_le_bytes(len_buf) as usize;
+        if frame_len > MAX_DEBUG_EVENT_SIZE {
+            break;
+        }
+
+        let mut event_buf = vec![0u8; frame_len];
+        if recv.read_exact(&mut event_buf).await.is_err() {
+            break;
+        }
+
+        let Ok(event) = DebugEvent::from_bytes(&event_buf) else {
+            continue;
+        };
+        if tx.send(event).await.is_err() {
+            break;
+        }
     }
 }
 

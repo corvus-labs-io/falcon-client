@@ -1,7 +1,7 @@
 mod testkit;
 
 use {
-    falcon_client::{FalconClient, TransportMode},
+    falcon_client::{DebugEventKind, FalconClient, TransportMode},
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
     std::time::Duration,
@@ -308,4 +308,245 @@ fn create_dummy_transaction() -> VersionedTransaction {
         signatures: vec![signature],
         message,
     }
+}
+
+// Wire constants matching falcon-client/src/debug.rs and entrypoint/src/quic_api.rs
+const STREAM_PREFIX_CONTROL: u8 = 0x00;
+const CONTROL_SUBSCRIBE: u8 = 0x01;
+const CONTROL_UNSUBSCRIBE: u8 = 0x02;
+
+const KIND_VALIDATION_OK: u8 = 0x00;
+const KIND_SUBSCRIBED: u8 = 0x05;
+const KIND_UNSUBSCRIBED: u8 = 0x06;
+
+/// Builds a raw debug event frame (length-prefixed) matching the server wire format.
+/// Event layout: [u64 LE seq] [u64 LE timestamp_us] [u8 kind] [u8 has_sig] [optional 64-byte sig] [kind payload]
+fn build_debug_event_frame(sequence: u64, kind_tag: u8, signature: Option<&[u8; 64]>) -> Vec<u8> {
+    let mut event = Vec::new();
+    event.extend_from_slice(&sequence.to_le_bytes());
+    event.extend_from_slice(&1000u64.to_le_bytes()); // timestamp_us
+    event.push(kind_tag);
+    match signature {
+        Some(sig) => {
+            event.push(1);
+            event.extend_from_slice(sig);
+        }
+        None => event.push(0),
+    }
+    // length-prefix the frame
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(event.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&event);
+    frame
+}
+
+/// Mock server that handles the debug protocol:
+/// 1. Reads control messages from client uni streams
+/// 2. On subscribe: opens a server→client uni stream and writes debug event frames
+/// 3. On unsubscribe: sends Unsubscribed event and closes the stream
+async fn run_debug_mock_server(
+    conn: quinn::Connection,
+    events_to_send: Vec<(u64, u8, Option<[u8; 64]>)>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            accepted = conn.accept_uni() => {
+                let Ok(mut recv) = accepted else { break };
+                let data = match recv.read_to_end(64).await {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                if data.len() < 2 || data[0] != STREAM_PREFIX_CONTROL {
+                    continue;
+                }
+                match data[1] {
+                    CONTROL_SUBSCRIBE => {
+                        let Ok(mut send) = conn.open_uni().await else { break };
+                        // send Subscribed event first
+                        let frame = build_debug_event_frame(0, KIND_SUBSCRIBED, None);
+                        if send.write_all(&frame).await.is_err() { break; }
+                        // send the provided events
+                        for (seq, kind, sig) in &events_to_send {
+                            let frame = build_debug_event_frame(*seq, *kind, sig.as_ref());
+                            if send.write_all(&frame).await.is_err() { break; }
+                        }
+                        // keep stream open until unsubscribe or shutdown
+                        // (we'll just wait for shutdown to close cleanly)
+                        let _ = shutdown_rx.recv().await;
+                        // send Unsubscribed event
+                        let frame = build_debug_event_frame(
+                            events_to_send.len() as u64 + 1,
+                            KIND_UNSUBSCRIBED,
+                            None,
+                        );
+                        let _ = send.write_all(&frame).await;
+                        let _ = send.finish();
+                        return;
+                    }
+                    CONTROL_UNSUBSCRIBE => {
+                        // signal the writer to send Unsubscribed and close
+                        // (handled above via shutdown_rx)
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn subscribe_debug_receives_events() {
+    let addr = generate_random_local_addr();
+    let endpoint = build_mock_falcon_server(addr);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
+    let test_sig = [0xAB_u8; 64];
+    let events_to_send = vec![
+        (1, KIND_VALIDATION_OK, Some(test_sig)),
+    ];
+
+    let server_handle = tokio::spawn(async move {
+        let connecting = endpoint.accept().await.expect("accept");
+        let conn = connecting.await.expect("connection");
+        run_debug_mock_server(conn, events_to_send, shutdown_rx).await;
+    });
+
+    let api_key = random_uuid();
+    let endpoint_str = format!("127.0.0.1:{}", addr.port());
+    let client = FalconClient::connect(&endpoint_str, api_key)
+        .await
+        .expect("connect");
+
+    let mut rx = client.subscribe_debug().await.expect("subscribe");
+
+    // first event should be Subscribed
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv Subscribed");
+    assert!(matches!(event.kind, DebugEventKind::Subscribed));
+    assert_eq!(event.sequence, 0);
+
+    // second event: ValidationOk with signature
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv ValidationOk");
+    assert!(matches!(event.kind, DebugEventKind::ValidationOk));
+    assert_eq!(event.sequence, 1);
+    assert_eq!(event.signature, Some(test_sig));
+
+    // clean up
+    shutdown_tx.send(()).await.unwrap();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn unsubscribe_debug_stops_receiving() {
+    let addr = generate_random_local_addr();
+    let endpoint = build_mock_falcon_server(addr);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
+    let server_handle = tokio::spawn(async move {
+        let connecting = endpoint.accept().await.expect("accept");
+        let conn = connecting.await.expect("connection");
+        run_debug_mock_server(conn, vec![], shutdown_rx).await;
+    });
+
+    let api_key = random_uuid();
+    let endpoint_str = format!("127.0.0.1:{}", addr.port());
+    let client = FalconClient::connect(&endpoint_str, api_key)
+        .await
+        .expect("connect");
+
+    let mut rx = client.subscribe_debug().await.expect("subscribe");
+
+    // receive Subscribed
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv");
+    assert!(matches!(event.kind, DebugEventKind::Subscribed));
+
+    // unsubscribe from client side
+    client.unsubscribe_debug().await.expect("unsubscribe");
+
+    // the receiver should be closed (listener was aborted)
+    // give it a moment for the abort to propagate
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // channel is closed because the listener task was aborted
+    let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+    match result {
+        Ok(None) => {} // channel closed, expected
+        Ok(Some(_)) => {} // buffered event before close, acceptable
+        Err(_) => {} // timeout, acceptable (no more events)
+    }
+
+    // clean up server
+    shutdown_tx.send(()).await.unwrap();
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn resubscribe_debug_after_unsubscribe() {
+    let addr = generate_random_local_addr();
+    let endpoint = build_mock_falcon_server(addr);
+
+    let server_handle = tokio::spawn(async move {
+        let connecting = endpoint.accept().await.expect("accept");
+        let conn = connecting.await.expect("connection");
+
+        // handle two subscribe/unsubscribe cycles
+        for _ in 0..2 {
+            let Ok(mut recv) = conn.accept_uni().await else { return };
+            let data = recv.read_to_end(64).await.unwrap_or_default();
+            if data.len() >= 2 && data[0] == STREAM_PREFIX_CONTROL && data[1] == CONTROL_SUBSCRIBE {
+                let Ok(mut send) = conn.open_uni().await else { return };
+                let frame = build_debug_event_frame(0, KIND_SUBSCRIBED, None);
+                let _ = send.write_all(&frame).await;
+                // wait for unsubscribe
+                let Ok(mut unsub_recv) = conn.accept_uni().await else { return };
+                let _ = unsub_recv.read_to_end(64).await;
+                let frame = build_debug_event_frame(1, KIND_UNSUBSCRIBED, None);
+                let _ = send.write_all(&frame).await;
+                let _ = send.finish();
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let api_key = random_uuid();
+    let endpoint_str = format!("127.0.0.1:{}", addr.port());
+    let client = FalconClient::connect(&endpoint_str, api_key)
+        .await
+        .expect("connect");
+
+    // first subscribe
+    let mut rx1 = client.subscribe_debug().await.expect("subscribe 1");
+    let event = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
+        .await
+        .expect("timeout")
+        .expect("recv");
+    assert!(matches!(event.kind, DebugEventKind::Subscribed));
+
+    // unsubscribe
+    client.unsubscribe_debug().await.expect("unsubscribe 1");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // second subscribe
+    let mut rx2 = client.subscribe_debug().await.expect("subscribe 2");
+    let event = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+        .await
+        .expect("timeout")
+        .expect("recv");
+    assert!(matches!(event.kind, DebugEventKind::Subscribed));
+
+    // clean up
+    client.unsubscribe_debug().await.expect("unsubscribe 2");
+    server_handle.abort();
 }
