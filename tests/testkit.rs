@@ -155,6 +155,7 @@ pub fn build_mock_falcon_server(addr: SocketAddr) -> Endpoint {
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport
         .max_idle_timeout(quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).ok());
+    transport.datagram_receive_buffer_size(Some(2_097_152));
     server_config.transport_config(Arc::new(transport));
 
     Endpoint::server(server_config, addr).expect("server endpoint")

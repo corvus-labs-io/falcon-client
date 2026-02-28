@@ -1,7 +1,7 @@
 mod testkit;
 
 use {
-    falcon_client::FalconClient,
+    falcon_client::{FalconClient, TransportMode},
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
     std::time::Duration,
@@ -120,7 +120,7 @@ async fn is_connected_returns_false_when_server_closes() {
 }
 
 #[tokio::test]
-async fn send_transaction_to_accepting_server() {
+async fn send_transaction_stream_mode() {
     let addr = generate_random_local_addr();
     let endpoint = build_mock_falcon_server(addr);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
@@ -142,6 +142,46 @@ async fn send_transaction_to_accepting_server() {
     let client = FalconClient::connect(&endpoint_str, api_key)
         .await
         .expect("connect");
+
+    let transaction = create_dummy_transaction();
+
+    let result = client.send_transaction(&transaction).await;
+
+    assert!(result.is_ok());
+
+    let received_data = rx.recv().await.expect("receive data");
+    assert!(!received_data.is_empty());
+
+    let deserialized: VersionedTransaction =
+        falcon_client::deserialize_transaction(&received_data).expect("deserialize");
+    assert_eq!(deserialized.signatures, transaction.signatures);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn send_transaction_datagram_mode() {
+    let addr = generate_random_local_addr();
+    let endpoint = build_mock_falcon_server(addr);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+
+    let server_handle = tokio::spawn(async move {
+        let connecting = endpoint.accept().await.expect("accept");
+        let conn = connecting.await.expect("connection");
+
+        let data = conn.read_datagram().await.expect("read datagram");
+        tx.send(data.to_vec()).await.expect("send to test");
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    let api_key = random_uuid();
+    let endpoint_str = format!("127.0.0.1:{}", addr.port());
+
+    let mut client = FalconClient::connect(&endpoint_str, api_key)
+        .await
+        .expect("connect");
+    client.set_transport_mode(TransportMode::Datagram);
 
     let transaction = create_dummy_transaction();
 

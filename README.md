@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let api_key = Uuid::parse_str("your-api-key-here")?;
     
     // FalconClient::connect binds to an ephemeral port. 
-    // FalconClient::connect_with_bind specifies the static inbound peer port
+    // Use connect_with_bind to specify a static local port for firewall rules.
     let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
 
     let transaction: VersionedTransaction = /* your transaction */;
@@ -31,33 +31,72 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## How It Works
+## Transport Modes
 
-The client opens a QUIC connection from your application to Falcon. Transactions are serialized with wincode and sent over unidirectional QUIC streams — one stream per transaction.
+The client supports two delivery mechanisms: reliable streams and unreliable datagrams.
 
-Authentication uses mTLS: your API key is embedded in a self-signed client certificate, which Falcon validates on connection. No additional auth headers or tokens are needed after the initial handshake.
+### User Personas
 
-If the connection drops, `send_transaction` reconnects automatically before retrying the send. Concurrent callers are coalesced — only one reconnect happens at a time.
+* **Co-located users**: Applications in the same datacenter as Falcon (FRA) experience near-zero packet loss. Datagrams are recommended for lowest latency by removing stream-open overhead.
+* **Fire-and-forget users**: Applications implementing custom retry logic or inclusion checking can use datagrams. Transport-level reliability is redundant in these workflows.
+* **Remote or reliability-critical users**: Applications connecting over the public internet or requiring guaranteed delivery to the Falcon ingress should use streams (default).
+
+### Which mode should I use?
+
+| Scenario | Recommended Mode | Why |
+| :--- | :--- | :--- |
+| Same DC as Falcon | Datagram | Lowest latency, ~0% packet loss |
+| Custom retry logic | Datagram | Avoids redundant transport reliability |
+| Public internet | Stream | QUIC handles packet loss retransmission |
+| Critical delivery | Stream | Guaranteed arrival at ingress |
+
+### Reliability Details
+
+In **Datagram** mode, `send_transaction` returning `Ok` only confirms the packet was handed to the local network stack. If the UDP packet is dropped on the wire, the transaction silently never arrives.
+
+In **Stream** mode, the client opens a unidirectional QUIC stream for each transaction. QUIC automatically handles retransmissions if packets are lost, ensuring the transaction reaches the server.
+
+## Usage Examples
+
+### Stream Mode (Default)
+
+```rust
+let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+client.send_transaction(&tx).await?;
+```
+
+Customize the stream send timeout (default 500ms):
+```rust
+use std::time::Duration;
+client.set_send_timeout(Duration::from_millis(200));
+```
+
+### Datagram Mode (Opt-in)
+
+```rust
+use falcon_client::TransportMode;
+
+let mut client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+client.set_transport_mode(TransportMode::Datagram);
+client.send_transaction(&tx).await?;
+```
 
 ## Connection Parameters
 
-All timeouts are compile-time constants:
-
-| Parameter           | Value | Description                                 |
-| ------------------- | ----- | ------------------------------------------- |
-| Keep-alive interval | 25s   | QUIC keep-alive ping interval               |
-| Idle timeout        | 30s   | Connection closed after inactivity          |
-| Connect timeout     | 5s    | Initial connection timeout                  |
-| Stream open timeout | 200ms | Timeout for opening a unidirectional stream |
-| Write timeout       | 500ms | Transaction send timeout                    |
+| Parameter | Value | Description |
+| :--- | :--- | :--- |
+| Keep-alive interval | 25s | QUIC keep-alive ping interval |
+| Idle timeout | 30s | Connection closed after inactivity |
+| Connect timeout | 5s | Initial connection timeout |
+| Send timeout | 500ms | Stream open and write timeout (stream only) |
+| Initial MTU | 1472 | Matches Falcon server MTU |
 
 ## Transport Details
 
-- **Protocol**: QUIC via [quinn](https://docs.rs/quinn)
-- **TLS**: rustls with X25519 key exchange, client certificate authentication
-- **ALPN**: `falcon-tx`
-- **Serialization**: wincode
-- **Streams**: Unidirectional, one per transaction
+* **Protocol**: QUIC via quinn
+* **TLS**: rustls with X25519 and mTLS client certificates
+* **ALPN**: `falcon-tx`
+* **Serialization**: wincode
 
 ## License
 
