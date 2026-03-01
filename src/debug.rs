@@ -1,17 +1,16 @@
 // Wire protocol constants for the debug event stream.
 //
-// Control messages (client → server on uni stream):
-//   byte 0 = 0x00 (control prefix, valid transactions start with sig count ≥ 1)
-//   byte 1 = command (CONTROL_SUBSCRIBE or CONTROL_UNSUBSCRIBE)
+// Control (client → server on bi-stream send half):
+//   byte 0 = 0x00 (control prefix)
+//   byte 1 = CONTROL_SUBSCRIBE
+//   Closing the send half signals unsubscribe.
 //
-// Debug events (server → client on a single uni stream):
+// Debug events (server → client on bi-stream recv half):
 //   repeating frames: [u32 LE length] [event bytes]
 
 pub(crate) const STREAM_PREFIX_CONTROL: u8 = 0x00;
 
 pub(crate) const CONTROL_SUBSCRIBE: u8 = 0x01;
-
-pub(crate) const CONTROL_UNSUBSCRIBE: u8 = 0x02;
 
 const KIND_VALIDATION_OK: u8 = 0x00;
 const KIND_VALIDATION_ERR: u8 = 0x01;

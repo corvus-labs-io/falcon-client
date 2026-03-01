@@ -313,7 +313,6 @@ fn create_dummy_transaction() -> VersionedTransaction {
 // Wire constants matching falcon-client/src/debug.rs and entrypoint/src/quic_api.rs
 const STREAM_PREFIX_CONTROL: u8 = 0x00;
 const CONTROL_SUBSCRIBE: u8 = 0x01;
-const CONTROL_UNSUBSCRIBE: u8 = 0x02;
 
 const KIND_VALIDATION_OK: u8 = 0x00;
 const KIND_SUBSCRIBED: u8 = 0x05;
@@ -340,10 +339,11 @@ fn build_debug_event_frame(sequence: u64, kind_tag: u8, signature: Option<&[u8; 
     frame
 }
 
-/// Mock server that handles the debug protocol:
-/// 1. Reads control messages from client uni streams
-/// 2. On subscribe: opens a server→client uni stream and writes debug event frames
-/// 3. On unsubscribe: sends Unsubscribed event and closes the stream
+/// Mock server that handles the debug bi-stream protocol:
+/// 1. Accepts a bi-stream from the client
+/// 2. Reads subscribe control from recv half
+/// 3. Writes debug event frames on the send half
+/// 4. Detects unsubscribe (client closes send half) or shutdown
 async fn run_debug_mock_server(
     conn: quinn::Connection,
     events_to_send: Vec<(u64, u8, Option<[u8; 64]>)>,
@@ -351,45 +351,36 @@ async fn run_debug_mock_server(
 ) {
     loop {
         tokio::select! {
-            accepted = conn.accept_uni() => {
-                let Ok(mut recv) = accepted else { break };
-                let data = match recv.read_to_end(64).await {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                if data.len() < 2 || data[0] != STREAM_PREFIX_CONTROL {
+            accepted_bi = conn.accept_bi() => {
+                let Ok((mut send, mut recv)) = accepted_bi else { break };
+                let mut buf = [0u8; 2];
+                if recv.read_exact(&mut buf).await.is_err() { continue; }
+                if buf[0] != STREAM_PREFIX_CONTROL || buf[1] != CONTROL_SUBSCRIBE {
                     continue;
                 }
-                match data[1] {
-                    CONTROL_SUBSCRIBE => {
-                        let Ok(mut send) = conn.open_uni().await else { break };
-                        // send Subscribed event first
-                        let frame = build_debug_event_frame(0, KIND_SUBSCRIBED, None);
-                        if send.write_all(&frame).await.is_err() { break; }
-                        // send the provided events
-                        for (seq, kind, sig) in &events_to_send {
-                            let frame = build_debug_event_frame(*seq, *kind, sig.as_ref());
-                            if send.write_all(&frame).await.is_err() { break; }
-                        }
-                        // keep stream open until unsubscribe or shutdown
-                        // (we'll just wait for shutdown to close cleanly)
-                        let _ = shutdown_rx.recv().await;
-                        // send Unsubscribed event
-                        let frame = build_debug_event_frame(
-                            events_to_send.len() as u64 + 1,
-                            KIND_UNSUBSCRIBED,
-                            None,
-                        );
-                        let _ = send.write_all(&frame).await;
-                        let _ = send.finish();
-                        return;
-                    }
-                    CONTROL_UNSUBSCRIBE => {
-                        // signal the writer to send Unsubscribed and close
-                        // (handled above via shutdown_rx)
-                    }
-                    _ => {}
+                // send Subscribed event
+                let frame = build_debug_event_frame(0, KIND_SUBSCRIBED, None);
+                if send.write_all(&frame).await.is_err() { break; }
+                // send the provided events
+                for (seq, kind, sig) in &events_to_send {
+                    let frame = build_debug_event_frame(*seq, *kind, sig.as_ref());
+                    if send.write_all(&frame).await.is_err() { break; }
                 }
+                // wait for unsubscribe (client closes send half) or shutdown
+                let mut close_buf = [0u8; 1];
+                tokio::select! {
+                    _ = recv.read(&mut close_buf) => {}
+                    _ = shutdown_rx.recv() => {}
+                }
+                // send Unsubscribed and close
+                let frame = build_debug_event_frame(
+                    events_to_send.len() as u64 + 1,
+                    KIND_UNSUBSCRIBED,
+                    None,
+                );
+                let _ = send.write_all(&frame).await;
+                let _ = send.finish();
+                return;
             }
             _ = tokio::time::sleep(Duration::from_secs(10)) => {
                 break;
@@ -405,9 +396,7 @@ async fn subscribe_debug_receives_events() {
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
     let test_sig = [0xAB_u8; 64];
-    let events_to_send = vec![
-        (1, KIND_VALIDATION_OK, Some(test_sig)),
-    ];
+    let events_to_send = vec![(1, KIND_VALIDATION_OK, Some(test_sig))];
 
     let server_handle = tokio::spawn(async move {
         let connecting = endpoint.accept().await.expect("accept");
@@ -482,14 +471,14 @@ async fn unsubscribe_debug_stops_receiving() {
     // channel is closed because the listener task was aborted
     let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
     match result {
-        Ok(None) => {} // channel closed, expected
+        Ok(None) => {}    // channel closed, expected
         Ok(Some(_)) => {} // buffered event before close, acceptable
-        Err(_) => {} // timeout, acceptable (no more events)
+        Err(_) => {}      // timeout, acceptable (no more events)
     }
 
-    // clean up server
-    shutdown_tx.send(()).await.unwrap();
-    server_handle.await.unwrap();
+    // Server may have already exited after handling the unsubscribe
+    let _ = shutdown_tx.send(()).await;
+    let _ = server_handle.await;
 }
 
 #[tokio::test]
@@ -503,19 +492,23 @@ async fn resubscribe_debug_after_unsubscribe() {
 
         // handle two subscribe/unsubscribe cycles
         for _ in 0..2 {
-            let Ok(mut recv) = conn.accept_uni().await else { return };
-            let data = recv.read_to_end(64).await.unwrap_or_default();
-            if data.len() >= 2 && data[0] == STREAM_PREFIX_CONTROL && data[1] == CONTROL_SUBSCRIBE {
-                let Ok(mut send) = conn.open_uni().await else { return };
-                let frame = build_debug_event_frame(0, KIND_SUBSCRIBED, None);
-                let _ = send.write_all(&frame).await;
-                // wait for unsubscribe
-                let Ok(mut unsub_recv) = conn.accept_uni().await else { return };
-                let _ = unsub_recv.read_to_end(64).await;
-                let frame = build_debug_event_frame(1, KIND_UNSUBSCRIBED, None);
-                let _ = send.write_all(&frame).await;
-                let _ = send.finish();
-            }
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                return;
+            };
+            let mut buf = [0u8; 2];
+            if recv.read_exact(&mut buf).await.is_err() { return; }
+            if buf[0] != STREAM_PREFIX_CONTROL || buf[1] != CONTROL_SUBSCRIBE { return; }
+
+            let frame = build_debug_event_frame(0, KIND_SUBSCRIBED, None);
+            let _ = send.write_all(&frame).await;
+
+            // wait for unsubscribe (client closes send half)
+            let mut close_buf = [0u8; 1];
+            let _ = recv.read(&mut close_buf).await;
+
+            let frame = build_debug_event_frame(1, KIND_UNSUBSCRIBED, None);
+            let _ = send.write_all(&frame).await;
+            let _ = send.finish();
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     });

@@ -42,10 +42,10 @@ pub use wire::{deserialize_transaction, serialize_transaction};
 use {
     anyhow::{Context, Result, anyhow},
     arc_swap::ArcSwap,
-    debug::{CONTROL_SUBSCRIBE, CONTROL_UNSUBSCRIBE, MAX_DEBUG_EVENT_SIZE, STREAM_PREFIX_CONTROL},
+    debug::{CONTROL_SUBSCRIBE, MAX_DEBUG_EVENT_SIZE, STREAM_PREFIX_CONTROL},
     quinn::{
         ClientConfig, Connection, Endpoint, IdleTimeout, SendDatagramError, TransportConfig,
-        crypto::rustls::QuicClientConfig,
+        VarInt, crypto::rustls::QuicClientConfig,
     },
     rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair},
     solana_transaction::versioned::VersionedTransaction,
@@ -145,7 +145,12 @@ pub struct FalconClient {
     reconnect: Mutex<()>,
     transport_mode: TransportMode,
     send_timeout: Duration,
-    debug_listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    debug_listener: Mutex<Option<DebugSubscription>>,
+}
+
+struct DebugSubscription {
+    reader: tokio::task::JoinHandle<()>,
+    send: quinn::SendStream,
 }
 
 impl FalconClient {
@@ -187,6 +192,10 @@ impl FalconClient {
         transport.mtu_discovery_config(None);
         // Enable datagram negotiation so Datagram mode works without reconnect.
         transport.datagram_receive_buffer_size(Some(65535));
+        // Allow server to open uni streams for debug events.
+        transport.max_concurrent_uni_streams(VarInt::from_u32(2));
+        // Client never accepts server-initiated bi-streams.
+        transport.max_concurrent_bidi_streams(VarInt::from_u32(0));
 
         let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
         client_config.transport_config(Arc::new(transport));
@@ -329,100 +338,80 @@ impl FalconClient {
         self.connection.load().close_reason().is_none()
     }
 
+    /// Closes the QUIC connection immediately, notifying the server.
+    ///
+    /// Sends a CONNECTION_CLOSE frame so the server can reclaim the
+    /// connection slot without waiting for idle timeout.
+    pub fn close(&self) {
+        self.connection.load().close(VarInt::from_u32(0), b"done");
+    }
+
     /// Subscribes to real-time debug events for this connection.
     ///
-    /// Returns a channel receiver that yields [`DebugEvent`] values as the
-    /// server processes your transactions. Only one subscription is active
-    /// at a time — call [`unsubscribe_debug`](Self::unsubscribe_debug) first
-    /// to re-subscribe.
+    /// Opens a bi-directional QUIC stream to the server carrying the
+    /// subscribe signal on the send half and debug events on the recv half.
+    /// Only one subscription is active at a time — call
+    /// [`unsubscribe_debug`](Self::unsubscribe_debug) first to re-subscribe.
     ///
     /// The debug stream has no impact on transaction processing performance.
     pub async fn subscribe_debug(&self) -> Result<tokio::sync::mpsc::Receiver<DebugEvent>> {
-        {
-            let guard = self.debug_listener.lock().await;
-            if guard.is_some() {
-                anyhow::bail!("already subscribed to debug events — call unsubscribe_debug first");
-            }
+        let mut guard = self.debug_listener.lock().await;
+        // Auto-clear stale subscription whose reader has already exited (e.g. connection drop).
+        if matches!(guard.as_ref(), Some(sub) if sub.reader.is_finished()) {
+            guard.take();
+        }
+        if guard.is_some() {
+            anyhow::bail!("already subscribed to debug events \u{2014} call unsubscribe_debug first");
         }
 
         let conn = self.connection.load_full();
-        tokio::time::timeout(DEBUG_CONTROL_TIMEOUT, async {
-            let mut control_stream = conn
-                .open_uni()
+
+        // Open a bi-stream: send half carries subscribe, recv half delivers events.
+        let (send, recv) = tokio::time::timeout(DEBUG_CONTROL_TIMEOUT, async {
+            let (mut send, recv) = conn
+                .open_bi()
                 .await
-                .context("failed to open control stream")?;
-            control_stream
-                .write_all(&[STREAM_PREFIX_CONTROL, CONTROL_SUBSCRIBE])
+                .context("failed to open debug bi-stream")?;
+            send.write_all(&[STREAM_PREFIX_CONTROL, CONTROL_SUBSCRIBE])
                 .await
                 .context("failed to send subscribe")?;
-            control_stream
-                .finish()
-                .context("failed to finish control stream")?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>((send, recv))
         })
         .await
-        .context("subscribe control timeout")??;
+        .context("debug subscribe timeout")??;
 
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
 
-        let handle = tokio::spawn(async move {
-            let Ok(recv) = conn.accept_uni().await else {
-                return;
-            };
+        let reader = tokio::spawn(async move {
             read_debug_stream(recv, tx).await;
         });
 
-        *self.debug_listener.lock().await = Some(handle);
+        *guard = Some(DebugSubscription { reader, send });
         Ok(rx)
     }
 
     /// Unsubscribes from debug events without closing the connection.
     ///
-    /// Sends an unsubscribe control message, waits briefly for the server
-    /// to deliver a final [`DebugEventKind::Unsubscribed`] event, then
-    /// tears down the listener. Transaction flow is unaffected.
+    /// Closes the debug bi-stream's send half, which the server interprets as
+    /// an unsubscribe. Waits briefly for a final [`DebugEventKind::Unsubscribed`]
+    /// event, then tears down the listener. Transaction flow is unaffected.
     pub async fn unsubscribe_debug(&self) -> Result<()> {
-        // Send control unsubscribe first so server can deliver Unsubscribed event
-        let conn = self.connection.load();
-        let send_result = tokio::time::timeout(DEBUG_CONTROL_TIMEOUT, async {
-            let mut control_stream = conn
-                .open_uni()
+        let sub = self.debug_listener.lock().await.take();
+        if let Some(mut sub) = sub {
+            let _ = sub.send.finish();
+            let abort = sub.reader.abort_handle();
+            if tokio::time::timeout(Duration::from_millis(200), sub.reader)
                 .await
-                .context("failed to open control stream")?;
-            control_stream
-                .write_all(&[STREAM_PREFIX_CONTROL, CONTROL_UNSUBSCRIBE])
-                .await
-                .context("failed to send unsubscribe")?;
-            control_stream
-                .finish()
-                .context("failed to finish control stream")?;
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("unsubscribe control timeout")?;
-
-        // Wait briefly for listener to receive Unsubscribed event, then abort as fallback
-        {
-            let mut guard = self.debug_listener.lock().await;
-            if let Some(handle) = guard.take() {
-                let abort = handle.abort_handle();
-                if tokio::time::timeout(Duration::from_millis(200), handle)
-                    .await
-                    .is_err()
-                {
-                    abort.abort();
-                }
+                .is_err()
+            {
+                abort.abort();
             }
         }
-
-        send_result
+        Ok(())
     }
 }
 
-async fn read_debug_stream(
-    mut recv: quinn::RecvStream,
-    tx: tokio::sync::mpsc::Sender<DebugEvent>,
-) {
+async fn read_debug_stream(mut recv: quinn::RecvStream, tx: tokio::sync::mpsc::Sender<DebugEvent>) {
     loop {
         let mut len_buf = [0u8; 4];
         if recv.read_exact(&mut len_buf).await.is_err() {
