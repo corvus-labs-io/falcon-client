@@ -496,8 +496,12 @@ async fn resubscribe_debug_after_unsubscribe() {
                 return;
             };
             let mut buf = [0u8; 2];
-            if recv.read_exact(&mut buf).await.is_err() { return; }
-            if buf[0] != STREAM_PREFIX_CONTROL || buf[1] != CONTROL_SUBSCRIBE { return; }
+            if recv.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            if buf[0] != STREAM_PREFIX_CONTROL || buf[1] != CONTROL_SUBSCRIBE {
+                return;
+            }
 
             let frame = build_debug_event_frame(0, KIND_SUBSCRIBED, None);
             let _ = send.write_all(&frame).await;

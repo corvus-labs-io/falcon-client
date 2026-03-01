@@ -361,7 +361,9 @@ impl FalconClient {
             guard.take();
         }
         if guard.is_some() {
-            anyhow::bail!("already subscribed to debug events \u{2014} call unsubscribe_debug first");
+            anyhow::bail!(
+                "already subscribed to debug events \u{2014} call unsubscribe_debug first"
+            );
         }
 
         let conn = self.connection.load_full();
