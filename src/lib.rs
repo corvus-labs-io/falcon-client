@@ -1,33 +1,51 @@
-//! Rust client library for submitting Solana transactions to Falcon via QUIC.
+//! Rust client for submitting Solana transactions to Falcon via QUIC.
 //!
-//! # Quick Start
+//! # Transport modes
+//!
+//! | Mode | Delivery | Best for |
+//! |------|----------|----------|
+//! | [`TransportMode::Stream`] (default) | Reliable (QUIC retransmits) | Remote users, guaranteed delivery |
+//! | [`TransportMode::Datagram`] (opt-in) | Fire-and-forget | Co-located users, custom retry logic |
+//!
+//! # Quick start
 //!
 //! ```no_run
-//! use falcon_client::FalconClient;
+//! use falcon_client::{FalconClient, TransportMode};
 //! use solana_transaction::versioned::VersionedTransaction;
 //! use uuid::Uuid;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let api_key = Uuid::parse_str("your-api-key-here")?;
-//! let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+//! let mut client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+//!
+//! // Switch to datagrams if co-located with Falcon (same DC).
+//! client.set_transport_mode(TransportMode::Datagram);
 //!
 //! let transaction: VersionedTransaction = todo!();
 //! client.send_transaction(&transaction).await?;
 //! # Ok(())
 //! # }
 //! ```
+//! # Debug mode
+//!
+//! Call [`FalconClient::subscribe_debug`] to receive real-time processing
+//! events for your transactions. See [`DebugEvent`] for event types.
+//!
 
+mod debug;
 mod tls;
 mod wire;
 
+pub use debug::{DebugEvent, DebugEventKind};
 pub use wire::{deserialize_transaction, serialize_transaction};
 
 use {
     anyhow::{Context, Result, anyhow},
     arc_swap::ArcSwap,
+    debug::{CONTROL_SUBSCRIBE, MAX_DEBUG_EVENT_SIZE, STREAM_PREFIX_CONTROL},
     quinn::{
-        ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig,
-        crypto::rustls::QuicClientConfig,
+        ClientConfig, Connection, Endpoint, IdleTimeout, SendDatagramError, TransportConfig,
+        VarInt, crypto::rustls::QuicClientConfig,
     },
     rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair},
     solana_transaction::versioned::VersionedTransaction,
@@ -42,9 +60,42 @@ const ALPN_FALCON_TX: &[u8] = b"falcon-tx";
 const SERVER_NAME: &str = "falcon";
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(25);
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const OPEN_STREAM_TIMEOUT: Duration = Duration::from_millis(200);
-const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const INITIAL_MTU: u16 = 1472;
+const DEBUG_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Selects how transactions are delivered over the QUIC connection.
+///
+/// Both modes share the same connection. Switching modes via
+/// [`FalconClient::set_transport_mode`] takes effect immediately
+/// with no reconnect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Reliable delivery via unidirectional QUIC streams.
+    ///
+    /// Each transaction opens a stream, writes the payload, and finishes.
+    /// QUIC retransmits lost packets automatically. The combined open +
+    /// write + finish operation is bounded by [`FalconClient::set_send_timeout`]
+    /// (default 500ms).
+    #[default]
+    Stream,
+
+    /// Fire-and-forget delivery via QUIC datagrams ([RFC 9221]).
+    ///
+    /// No stream overhead — the payload is sent in a single QUIC frame.
+    /// `send_transaction` returning `Ok` only means the packet was queued
+    /// locally; if the UDP packet is dropped on the wire, the transaction
+    /// silently never arrives. Recommended when packet loss is negligible
+    /// (same datacenter) or the caller handles retries externally.
+    ///
+    /// Before sending, the client checks [`Connection::max_datagram_size`]
+    /// and returns an error if the payload exceeds the path MTU or the
+    /// server does not support datagrams.
+    ///
+    /// [RFC 9221]: https://datatracker.ietf.org/doc/html/rfc9221
+    Datagram,
+}
 
 fn generate_client_cert(
     api_key: Uuid,
@@ -76,30 +127,42 @@ fn generate_client_cert(
 
 /// QUIC client for submitting Solana transactions to Falcon.
 ///
-/// Opens a persistent QUIC connection authenticated via mTLS — the API key
-/// is embedded in a self-signed client certificate. If the connection drops,
-/// sends automatically reconnect before retrying.
+/// Maintains a persistent mTLS connection — the API key is embedded in a
+/// self-signed client certificate. If the connection drops, sends
+/// automatically reconnect and retry once.
+///
+/// # Transport modes
+///
+/// Defaults to [`TransportMode::Stream`] (reliable). Call
+/// [`set_transport_mode`](Self::set_transport_mode) to switch to
+/// [`TransportMode::Datagram`] for lower-latency fire-and-forget delivery.
+/// See [`TransportMode`] for trade-offs.
 pub struct FalconClient {
     endpoint: Endpoint,
     client_config: ClientConfig,
     addr: SocketAddr,
     connection: ArcSwap<Connection>,
     reconnect: Mutex<()>,
-    write_timeout: Duration,
+    transport_mode: TransportMode,
+    send_timeout: Duration,
+    debug_listener: Mutex<Option<DebugSubscription>>,
+}
+
+struct DebugSubscription {
+    reader: tokio::task::JoinHandle<()>,
+    send: quinn::SendStream,
 }
 
 impl FalconClient {
-    /// Opens a QUIC connection to Falcon, binding the local socket to an
-    /// ephemeral port.
+    /// Connects to Falcon, binding to an ephemeral local port.
     pub async fn connect(endpoint_addr: &str, api_key: Uuid) -> Result<Self> {
         Self::connect_with_bind(endpoint_addr, api_key, "0.0.0.0:0".parse()?).await
     }
 
-    /// Opens a QUIC connection to Falcon, binding the local socket to
-    /// `local_addr`.
+    /// Connects to Falcon, binding to `local_addr`.
     ///
-    /// Use a fixed port (e.g. `0.0.0.0:5002`) when a firewall rule must
-    /// allow inbound UDP responses from the server.
+    /// Use a fixed port (e.g. `0.0.0.0:5002`) when firewall rules must
+    /// allowlist the local UDP port.
     pub async fn connect_with_bind(
         endpoint_addr: &str,
         api_key: Uuid,
@@ -125,6 +188,14 @@ impl FalconClient {
         transport.max_idle_timeout(Some(
             IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("valid timeout"),
         ));
+        transport.initial_mtu(INITIAL_MTU);
+        transport.mtu_discovery_config(None);
+        // Enable datagram negotiation so Datagram mode works without reconnect.
+        transport.datagram_receive_buffer_size(Some(65535));
+        // Allow server to open uni streams for debug events.
+        transport.max_concurrent_uni_streams(VarInt::from_u32(2));
+        // Client never accepts server-initiated bi-streams.
+        transport.max_concurrent_bidi_streams(VarInt::from_u32(0));
 
         let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
         client_config.transport_config(Arc::new(transport));
@@ -149,22 +220,37 @@ impl FalconClient {
             addr,
             connection: ArcSwap::from_pointee(connection),
             reconnect: Mutex::new(()),
-            write_timeout: WRITE_TIMEOUT,
+            transport_mode: TransportMode::default(),
+            send_timeout: SEND_TIMEOUT,
+            debug_listener: Mutex::new(None),
         })
     }
 
-    /// Serializes and sends a transaction to Falcon.
+    /// Switches between [`TransportMode::Stream`] and [`TransportMode::Datagram`].
+    /// Takes effect on the next send — no reconnect required.
+    pub fn set_transport_mode(&mut self, mode: TransportMode) {
+        self.transport_mode = mode;
+    }
+
+    /// Overrides the send timeout for stream mode (default 500ms).
+    /// Covers the full open_uni + write_all + finish cycle.
+    /// Has no effect in datagram mode.
+    pub fn set_send_timeout(&mut self, timeout: Duration) {
+        self.send_timeout = timeout;
+    }
+
+    /// Wincode-serializes and sends a transaction.
     ///
-    /// The transaction is wincode-encoded and written to a new unidirectional
-    /// QUIC stream. If the first attempt fails, the connection is
-    /// re-established and the send is retried once.
+    /// Delivery semantics depend on the current [`TransportMode`].
+    /// On failure, reconnects and retries once before returning the error.
     pub async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<()> {
         let payload = wire::serialize_transaction(transaction)
             .map_err(|e| anyhow!("wincode serialize failed: {e}"))?;
         self.send_transaction_payload(&payload).await
     }
 
-    #[inline]
+    /// Sends a pre-serialized transaction payload. Same retry semantics
+    /// as [`send_transaction`](Self::send_transaction).
     pub async fn send_transaction_payload(&self, payload: &[u8]) -> Result<()> {
         if self.try_send(payload).await.is_ok() {
             return Ok(());
@@ -176,20 +262,49 @@ impl FalconClient {
     }
 
     async fn try_send(&self, payload: &[u8]) -> Result<()> {
-        let mut stream =
-            tokio::time::timeout(OPEN_STREAM_TIMEOUT, self.connection.load().open_uni())
-                .await
-                .context("open_uni timeout")??;
+        match self.transport_mode {
+            TransportMode::Stream => self.send_stream(payload).await,
+            TransportMode::Datagram => self.send_datagram(payload),
+        }
+    }
 
-        tokio::time::timeout(self.write_timeout, async {
+    fn send_datagram(&self, payload: &[u8]) -> Result<()> {
+        let conn = self.connection.load();
+
+        let max = conn
+            .max_datagram_size()
+            .ok_or_else(|| anyhow!("datagrams not supported by peer"))?;
+
+        if payload.len() > max {
+            anyhow::bail!(
+                "payload ({} bytes) exceeds max datagram size ({max} bytes)",
+                payload.len()
+            );
+        }
+
+        conn.send_datagram(bytes::Bytes::copy_from_slice(payload))
+            .map_err(|e| match e {
+                SendDatagramError::UnsupportedByPeer => anyhow!("datagrams not supported by peer"),
+                SendDatagramError::Disabled => anyhow!("datagrams disabled in transport config"),
+                SendDatagramError::TooLarge => {
+                    anyhow!("datagram exceeds path MTU ({} bytes)", payload.len())
+                }
+                SendDatagramError::ConnectionLost(reason) => {
+                    anyhow!("connection lost: {reason}")
+                }
+            })
+    }
+
+    async fn send_stream(&self, payload: &[u8]) -> Result<()> {
+        let conn = self.connection.load();
+        tokio::time::timeout(self.send_timeout, async {
+            let mut stream = conn.open_uni().await?;
             stream.write_all(payload).await?;
             stream.finish()?;
             Ok::<_, anyhow::Error>(())
         })
         .await
-        .context("write timeout")??;
-
-        Ok(())
+        .context("send timeout")?
     }
 
     async fn reconnect(&self, force: bool) -> Result<()> {
@@ -218,13 +333,108 @@ impl FalconClient {
         Ok(())
     }
 
-    pub fn set_write_timeout(&mut self, write_timeout: Duration) {
-        self.write_timeout = write_timeout;
-    }
-
     /// Returns `true` if the QUIC connection is active.
     pub fn is_connected(&self) -> bool {
         self.connection.load().close_reason().is_none()
+    }
+
+    /// Closes the QUIC connection immediately, notifying the server.
+    ///
+    /// Sends a CONNECTION_CLOSE frame so the server can reclaim the
+    /// connection slot without waiting for idle timeout.
+    pub fn close(&self) {
+        self.connection.load().close(VarInt::from_u32(0), b"done");
+    }
+
+    /// Subscribes to real-time debug events for this connection.
+    ///
+    /// Opens a bi-directional QUIC stream to the server carrying the
+    /// subscribe signal on the send half and debug events on the recv half.
+    /// Only one subscription is active at a time — call
+    /// [`unsubscribe_debug`](Self::unsubscribe_debug) first to re-subscribe.
+    ///
+    /// The debug stream has no impact on transaction processing performance.
+    pub async fn subscribe_debug(&self) -> Result<tokio::sync::mpsc::Receiver<DebugEvent>> {
+        let mut guard = self.debug_listener.lock().await;
+        // Auto-clear stale subscription whose reader has already exited (e.g. connection drop).
+        if matches!(guard.as_ref(), Some(sub) if sub.reader.is_finished()) {
+            guard.take();
+        }
+        if guard.is_some() {
+            anyhow::bail!(
+                "already subscribed to debug events \u{2014} call unsubscribe_debug first"
+            );
+        }
+
+        let conn = self.connection.load_full();
+
+        // Open a bi-stream: send half carries subscribe, recv half delivers events.
+        let (send, recv) = tokio::time::timeout(DEBUG_CONTROL_TIMEOUT, async {
+            let (mut send, recv) = conn
+                .open_bi()
+                .await
+                .context("failed to open debug bi-stream")?;
+            send.write_all(&[STREAM_PREFIX_CONTROL, CONTROL_SUBSCRIBE])
+                .await
+                .context("failed to send subscribe")?;
+            Ok::<_, anyhow::Error>((send, recv))
+        })
+        .await
+        .context("debug subscribe timeout")??;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+
+        let reader = tokio::spawn(async move {
+            read_debug_stream(recv, tx).await;
+        });
+
+        *guard = Some(DebugSubscription { reader, send });
+        Ok(rx)
+    }
+
+    /// Unsubscribes from debug events without closing the connection.
+    ///
+    /// Closes the debug bi-stream's send half, which the server interprets as
+    /// an unsubscribe. Waits briefly for a final [`DebugEventKind::Unsubscribed`]
+    /// event, then tears down the listener. Transaction flow is unaffected.
+    pub async fn unsubscribe_debug(&self) -> Result<()> {
+        let sub = self.debug_listener.lock().await.take();
+        if let Some(mut sub) = sub {
+            let _ = sub.send.finish();
+            let abort = sub.reader.abort_handle();
+            if tokio::time::timeout(Duration::from_millis(200), sub.reader)
+                .await
+                .is_err()
+            {
+                abort.abort();
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn read_debug_stream(mut recv: quinn::RecvStream, tx: tokio::sync::mpsc::Sender<DebugEvent>) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if recv.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let frame_len = u32::from_le_bytes(len_buf) as usize;
+        if frame_len > MAX_DEBUG_EVENT_SIZE {
+            break;
+        }
+
+        let mut event_buf = vec![0u8; frame_len];
+        if recv.read_exact(&mut event_buf).await.is_err() {
+            break;
+        }
+
+        let Ok(event) = DebugEvent::from_bytes(&event_buf) else {
+            continue;
+        };
+        if tx.send(event).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -284,13 +494,18 @@ mod tests {
     }
 
     #[test]
+    fn default_transport_mode_is_stream() {
+        assert_eq!(TransportMode::default(), TransportMode::Stream);
+    }
+
+    #[test]
     fn constants_have_expected_values() {
         assert_eq!(ALPN_FALCON_TX, b"falcon-tx");
         assert_eq!(SERVER_NAME, "falcon");
         assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(25));
         assert_eq!(MAX_IDLE_TIMEOUT, Duration::from_secs(30));
-        assert_eq!(OPEN_STREAM_TIMEOUT, Duration::from_millis(200));
-        assert_eq!(WRITE_TIMEOUT, Duration::from_millis(500));
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(SEND_TIMEOUT, Duration::from_millis(500));
+        assert_eq!(INITIAL_MTU, 1472);
     }
 }

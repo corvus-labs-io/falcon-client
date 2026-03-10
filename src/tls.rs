@@ -27,9 +27,8 @@ pub fn crypto_provider() -> CryptoProvider {
 /// Only use this when the remote peer identity is validated out-of-band
 /// (e.g., via Solana's leader schedule). Otherwise this enables MITM attacks.
 ///
-/// IMPORTANT: Unlike a complete no-verify implementation, this still verifies
-/// TLS 1.2/1.3 handshake signatures. This is required because Solana validators
-/// expect proper TLS protocol compliance - skipping signature verification
+/// TLS 1.2/1.3 handshake signatures are still verified. Solana validators
+/// expect proper TLS protocol compliance — skipping signature verification
 /// causes validators to close connections after handshake completion.
 pub struct SkipServerVerification(Arc<CryptoProvider>);
 
