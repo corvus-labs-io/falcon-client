@@ -73,7 +73,7 @@ impl From<&Signature> for WincodeSignature {
 }
 
 enum WincodeVersionedMessage {
-    Legacy(WincodeLegacyMessage),
+    Classic(WincodeClassicMessage),
     V0(WincodeV0Message),
 }
 
@@ -84,8 +84,8 @@ unsafe impl<'de, C: Config> SchemaRead<'de, C> for WincodeVersionedMessage {
         let first_byte = *reader.peek()?;
 
         if first_byte < 0x80 {
-            let msg = <WincodeLegacyMessage as SchemaRead<'de, C>>::get(reader)?;
-            dst.write(WincodeVersionedMessage::Legacy(msg));
+            let msg = <WincodeClassicMessage as SchemaRead<'de, C>>::get(reader)?;
+            dst.write(WincodeVersionedMessage::Classic(msg));
         } else if first_byte == 0x80 {
             reader.consume(1)?;
             let msg = <WincodeV0Message as SchemaRead<'de, C>>::get(reader)?;
@@ -102,8 +102,8 @@ unsafe impl<C: Config> SchemaWrite<C> for WincodeVersionedMessage {
 
     fn size_of(src: &Self::Src) -> WriteResult<usize> {
         match src {
-            WincodeVersionedMessage::Legacy(msg) => {
-                <WincodeLegacyMessage as SchemaWrite<C>>::size_of(msg)
+            WincodeVersionedMessage::Classic(msg) => {
+                <WincodeClassicMessage as SchemaWrite<C>>::size_of(msg)
             }
             WincodeVersionedMessage::V0(msg) => {
                 let inner = <WincodeV0Message as SchemaWrite<C>>::size_of(msg)?;
@@ -116,8 +116,8 @@ unsafe impl<C: Config> SchemaWrite<C> for WincodeVersionedMessage {
 
     fn write(writer: &mut impl Writer, src: &Self::Src) -> WriteResult<()> {
         match src {
-            WincodeVersionedMessage::Legacy(msg) => {
-                <WincodeLegacyMessage as SchemaWrite<C>>::write(writer, msg)
+            WincodeVersionedMessage::Classic(msg) => {
+                <WincodeClassicMessage as SchemaWrite<C>>::write(writer, msg)
             }
             WincodeVersionedMessage::V0(msg) => {
                 <u8 as SchemaWrite<C>>::write(writer, &0x80)?;
@@ -130,7 +130,7 @@ unsafe impl<C: Config> SchemaWrite<C> for WincodeVersionedMessage {
 impl From<WincodeVersionedMessage> for VersionedMessage {
     fn from(msg: WincodeVersionedMessage) -> Self {
         match msg {
-            WincodeVersionedMessage::Legacy(m) => VersionedMessage::Legacy(m.into()),
+            WincodeVersionedMessage::Classic(m) => VersionedMessage::Legacy(m.into()),
             WincodeVersionedMessage::V0(m) => VersionedMessage::V0(m.into()),
         }
     }
@@ -140,7 +140,7 @@ impl From<&VersionedMessage> for WincodeVersionedMessage {
     fn from(msg: &VersionedMessage) -> Self {
         match msg {
             VersionedMessage::Legacy(m) => {
-                WincodeVersionedMessage::Legacy(WincodeLegacyMessage::from(m))
+                WincodeVersionedMessage::Classic(WincodeClassicMessage::from(m))
             }
             VersionedMessage::V0(m) => WincodeVersionedMessage::V0(WincodeV0Message::from(m)),
         }
@@ -148,7 +148,7 @@ impl From<&VersionedMessage> for WincodeVersionedMessage {
 }
 
 #[derive(DeriveRead, DeriveWrite)]
-struct WincodeLegacyMessage {
+struct WincodeClassicMessage {
     header: WincodeMessageHeader,
     #[wincode(with = "containers::Vec<WincodePubkey, ShortU16>")]
     account_keys: Vec<WincodePubkey>,
@@ -157,8 +157,8 @@ struct WincodeLegacyMessage {
     instructions: Vec<WincodeCompiledInstruction>,
 }
 
-impl From<WincodeLegacyMessage> for solana_message::Message {
-    fn from(msg: WincodeLegacyMessage) -> Self {
+impl From<WincodeClassicMessage> for solana_message::Message {
+    fn from(msg: WincodeClassicMessage) -> Self {
         solana_message::Message {
             header: msg.header.into(),
             account_keys: msg.account_keys.into_iter().map(|p| p.into()).collect(),
@@ -168,9 +168,9 @@ impl From<WincodeLegacyMessage> for solana_message::Message {
     }
 }
 
-impl From<&solana_message::Message> for WincodeLegacyMessage {
+impl From<&solana_message::Message> for WincodeClassicMessage {
     fn from(msg: &solana_message::Message) -> Self {
-        WincodeLegacyMessage {
+        WincodeClassicMessage {
             header: WincodeMessageHeader::from(&msg.header),
             account_keys: msg.account_keys.iter().map(WincodePubkey::from).collect(),
             recent_blockhash: WincodeHash::from(&msg.recent_blockhash),
@@ -356,7 +356,7 @@ impl From<&MessageAddressTableLookup> for WincodeAddressTableLookup {
 mod tests {
     use super::*;
 
-    fn legacy_transaction() -> VersionedTransaction {
+    fn classic_transaction() -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![Signature::from([0x01; 64])],
             message: VersionedMessage::Legacy(solana_message::Message {
@@ -422,8 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_transaction_wincode_roundtrip() {
-        let tx = legacy_transaction();
+    fn classic_transaction_wincode_roundtrip() {
+        let tx = classic_transaction();
         let bytes = serialize_transaction(&tx).expect("serialize");
         let deserialized = deserialize_transaction(&bytes).expect("deserialize");
         assert_transactions_equal(&tx, &deserialized);

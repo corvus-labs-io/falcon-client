@@ -129,9 +129,12 @@ async fn send_transaction_stream_mode() {
         let connecting = endpoint.accept().await.expect("accept");
         let conn = connecting.await.expect("connection");
 
-        let mut stream = conn.accept_uni().await.expect("accept uni");
-        let data = stream.read_to_end(65536).await.expect("read");
-        tx.send(data).await.expect("send to test");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept bi");
+        let data = recv.read_to_end(65536).await.expect("read");
+        let payload = data.strip_prefix(&[0x01]).expect("stream payload prefix");
+        tx.send(payload.to_vec()).await.expect("send to test");
+        send.write_all(&[0x01, 0x00]).await.expect("write ack");
+        send.finish().expect("finish ack");
 
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
@@ -287,13 +290,11 @@ async fn reconnect_happens_on_send_failure() {
 }
 
 fn create_dummy_transaction() -> VersionedTransaction {
-    use solana_message::Hash;
-    use solana_message::VersionedMessage;
-    use solana_message::legacy::Message as LegacyMessage;
+    use solana_message::{Hash, Message, VersionedMessage};
 
     let signature = Signature::from([1u8; 64]);
     let blockhash = Hash::from([2u8; 32]);
-    let message = VersionedMessage::Legacy(LegacyMessage {
+    let message = VersionedMessage::Legacy(Message {
         header: solana_message::MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,

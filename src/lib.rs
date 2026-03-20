@@ -72,12 +72,12 @@ const DEBUG_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// with no reconnect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TransportMode {
-    /// Reliable delivery via unidirectional QUIC streams.
+    /// Reliable delivery via bidirectional QUIC streams.
     ///
-    /// Each transaction opens a stream, writes the payload, and finishes.
-    /// QUIC retransmits lost packets automatically. The combined open +
-    /// write + finish operation is bounded by [`FalconClient::set_send_timeout`]
-    /// (default 500ms).
+    /// Each transaction opens a stream, writes the payload, then waits for a
+    /// server ack. QUIC retransmits lost packets automatically. The combined
+    /// open + write + ack roundtrip is bounded by
+    /// [`FalconClient::set_send_timeout`] (default 500ms).
     #[default]
     Stream,
 
@@ -95,6 +95,59 @@ pub enum TransportMode {
     ///
     /// [RFC 9221]: https://datatracker.ietf.org/doc/html/rfc9221
     Datagram,
+}
+
+/// Error returned when the server rejects a transaction submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitError {
+    /// Server rate-limited this submission.
+    RateLimited,
+    /// Transaction has no valid signature.
+    Unsigned,
+    /// Transaction does not include required tip.
+    MissingTip,
+    /// Could not deserialize the transaction.
+    DeserializeFailed,
+    /// Transaction exceeds maximum allowed size.
+    TooLarge,
+    /// Server failed to forward the transaction.
+    ForwardFailed,
+    /// Transaction signature count does not match.
+    SignatureCountMismatch,
+    /// Server returned an unknown error code.
+    Unknown(u8),
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited => write!(f, "rate limited"),
+            Self::Unsigned => write!(f, "unsigned transaction"),
+            Self::MissingTip => write!(f, "missing required tip"),
+            Self::DeserializeFailed => write!(f, "failed to deserialize transaction"),
+            Self::TooLarge => write!(f, "transaction too large"),
+            Self::ForwardFailed => write!(f, "server failed to forward transaction"),
+            Self::SignatureCountMismatch => write!(f, "signature count mismatch"),
+            Self::Unknown(code) => write!(f, "unknown server error (code {code:#x})"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
+impl SubmitError {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0x01 => Self::RateLimited,
+            0x02 => Self::Unsigned,
+            0x03 => Self::MissingTip,
+            0x04 => Self::DeserializeFailed,
+            0x05 => Self::TooLarge,
+            0x06 => Self::ForwardFailed,
+            0x07 => Self::SignatureCountMismatch,
+            other => Self::Unknown(other),
+        }
+    }
 }
 
 fn generate_client_cert(
@@ -194,8 +247,7 @@ impl FalconClient {
         transport.datagram_receive_buffer_size(Some(65535));
         // Allow server to open uni streams for debug events.
         transport.max_concurrent_uni_streams(VarInt::from_u32(2));
-        // Client never accepts server-initiated bi-streams.
-        transport.max_concurrent_bidi_streams(VarInt::from_u32(0));
+        transport.max_concurrent_bidi_streams(VarInt::from_u32(256));
 
         let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
         client_config.transport_config(Arc::new(transport));
@@ -233,7 +285,7 @@ impl FalconClient {
     }
 
     /// Overrides the send timeout for stream mode (default 500ms).
-    /// Covers the full open_uni + write_all + finish cycle.
+    /// Covers the full open_bi + write_all + response cycle.
     /// Has no effect in datagram mode.
     pub fn set_send_timeout(&mut self, timeout: Duration) {
         self.send_timeout = timeout;
@@ -298,10 +350,21 @@ impl FalconClient {
     async fn send_stream(&self, payload: &[u8]) -> Result<()> {
         let conn = self.connection.load();
         tokio::time::timeout(self.send_timeout, async {
-            let mut stream = conn.open_uni().await?;
-            stream.write_all(payload).await?;
-            stream.finish()?;
-            Ok::<_, anyhow::Error>(())
+            let (mut send, mut recv) = conn.open_bi().await?;
+            send.write_all(&[0x01]).await?;
+            send.write_all(payload).await?;
+            send.finish()?;
+
+            let mut resp = [0u8; 2];
+            recv.read_exact(&mut resp)
+                .await
+                .context("failed to read server response")?;
+
+            if resp[1] == 0x00 {
+                Ok(())
+            } else {
+                Err(SubmitError::from_code(resp[1]).into())
+            }
         })
         .await
         .context("send timeout")?
