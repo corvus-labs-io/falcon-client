@@ -23,8 +23,9 @@ use {
 ///
 /// Returns the raw bytes ready to send over the QUIC stream or datagram.
 pub fn serialize_transaction(tx: &VersionedTransaction) -> WriteResult<Vec<u8>> {
-    let wrapper = WincodeVersionedTransaction::from(tx);
-    wincode::serialize(&wrapper)
+    let mut bytes = Vec::with_capacity(serialized_transaction_size(tx)?);
+    write_transaction(&mut bytes, tx)?;
+    Ok(bytes)
 }
 
 /// Deserializes a [`VersionedTransaction`] from wincode wire format.
@@ -33,6 +34,185 @@ pub fn serialize_transaction(tx: &VersionedTransaction) -> WriteResult<Vec<u8>> 
 pub fn deserialize_transaction(bytes: &[u8]) -> ReadResult<VersionedTransaction> {
     let wrapper: WincodeVersionedTransaction = wincode::deserialize(bytes)?;
     Ok(wrapper.into())
+}
+
+fn serialized_transaction_size(tx: &VersionedTransaction) -> WriteResult<usize> {
+    let mut size = short_u16_size(tx.signatures.len())?;
+    size = checked_add(size, checked_mul(tx.signatures.len(), 64)?)?;
+    checked_add(size, serialized_message_size(&tx.message)?)
+}
+
+fn serialized_message_size(message: &VersionedMessage) -> WriteResult<usize> {
+    match message {
+        VersionedMessage::Legacy(message) => serialized_message_body_size(
+            &message.account_keys,
+            &message.recent_blockhash,
+            &message.instructions,
+        ),
+        VersionedMessage::V0(message) => {
+            let mut size = checked_add(
+                1,
+                serialized_message_body_size(
+                    &message.account_keys,
+                    &message.recent_blockhash,
+                    &message.instructions,
+                )?,
+            )?;
+            size = checked_add(size, short_u16_size(message.address_table_lookups.len())?)?;
+            for lookup in &message.address_table_lookups {
+                size = checked_add(size, serialized_lookup_size(lookup)?)?;
+            }
+            Ok(size)
+        }
+    }
+}
+
+fn serialized_message_body_size(
+    account_keys: &[Pubkey],
+    _recent_blockhash: &Hash,
+    instructions: &[CompiledInstruction],
+) -> WriteResult<usize> {
+    let mut size = 3;
+    size = checked_add(size, short_u16_size(account_keys.len())?)?;
+    size = checked_add(size, checked_mul(account_keys.len(), 32)?)?;
+    size = checked_add(size, 32)?;
+    size = checked_add(size, short_u16_size(instructions.len())?)?;
+    for instruction in instructions {
+        size = checked_add(size, serialized_instruction_size(instruction)?)?;
+    }
+    Ok(size)
+}
+
+fn serialized_instruction_size(instruction: &CompiledInstruction) -> WriteResult<usize> {
+    let mut size = 1;
+    size = checked_add(size, short_u16_size(instruction.accounts.len())?)?;
+    size = checked_add(size, instruction.accounts.len())?;
+    size = checked_add(size, short_u16_size(instruction.data.len())?)?;
+    checked_add(size, instruction.data.len())
+}
+
+fn serialized_lookup_size(lookup: &MessageAddressTableLookup) -> WriteResult<usize> {
+    let mut size = 32;
+    size = checked_add(size, short_u16_size(lookup.writable_indexes.len())?)?;
+    size = checked_add(size, lookup.writable_indexes.len())?;
+    size = checked_add(size, short_u16_size(lookup.readonly_indexes.len())?)?;
+    checked_add(size, lookup.readonly_indexes.len())
+}
+
+fn write_transaction(dst: &mut Vec<u8>, tx: &VersionedTransaction) -> WriteResult<()> {
+    write_short_u16(dst, tx.signatures.len())?;
+    for signature in &tx.signatures {
+        dst.extend_from_slice(signature.as_ref());
+    }
+    write_versioned_message(dst, &tx.message)
+}
+
+fn write_versioned_message(dst: &mut Vec<u8>, message: &VersionedMessage) -> WriteResult<()> {
+    match message {
+        VersionedMessage::Legacy(message) => write_message_body(
+            dst,
+            &message.header,
+            &message.account_keys,
+            &message.recent_blockhash,
+            &message.instructions,
+        ),
+        VersionedMessage::V0(message) => {
+            dst.push(0x80);
+            write_message_body(
+                dst,
+                &message.header,
+                &message.account_keys,
+                &message.recent_blockhash,
+                &message.instructions,
+            )?;
+            write_short_u16(dst, message.address_table_lookups.len())?;
+            for lookup in &message.address_table_lookups {
+                write_lookup(dst, lookup)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn write_message_body(
+    dst: &mut Vec<u8>,
+    header: &MessageHeader,
+    account_keys: &[Pubkey],
+    recent_blockhash: &Hash,
+    instructions: &[CompiledInstruction],
+) -> WriteResult<()> {
+    dst.extend_from_slice(&[
+        header.num_required_signatures,
+        header.num_readonly_signed_accounts,
+        header.num_readonly_unsigned_accounts,
+    ]);
+    write_short_u16(dst, account_keys.len())?;
+    for account_key in account_keys {
+        dst.extend_from_slice(&account_key.to_bytes());
+    }
+    dst.extend_from_slice(&recent_blockhash.to_bytes());
+    write_short_u16(dst, instructions.len())?;
+    for instruction in instructions {
+        write_instruction(dst, instruction)?;
+    }
+    Ok(())
+}
+
+fn write_instruction(dst: &mut Vec<u8>, instruction: &CompiledInstruction) -> WriteResult<()> {
+    dst.push(instruction.program_id_index);
+    write_short_u16(dst, instruction.accounts.len())?;
+    dst.extend_from_slice(&instruction.accounts);
+    write_short_u16(dst, instruction.data.len())?;
+    dst.extend_from_slice(&instruction.data);
+    Ok(())
+}
+
+fn write_lookup(dst: &mut Vec<u8>, lookup: &MessageAddressTableLookup) -> WriteResult<()> {
+    dst.extend_from_slice(&lookup.account_key.to_bytes());
+    write_short_u16(dst, lookup.writable_indexes.len())?;
+    dst.extend_from_slice(&lookup.writable_indexes);
+    write_short_u16(dst, lookup.readonly_indexes.len())?;
+    dst.extend_from_slice(&lookup.readonly_indexes);
+    Ok(())
+}
+
+fn short_u16_size(len: usize) -> WriteResult<usize> {
+    if len > u16::MAX as usize {
+        return Err(WriteError::LengthEncodingOverflow("u16::MAX"));
+    }
+
+    Ok(match len {
+        0..=0x7f => 1,
+        0x80..=0x3fff => 2,
+        _ => 3,
+    })
+}
+
+fn write_short_u16(dst: &mut Vec<u8>, len: usize) -> WriteResult<()> {
+    let len = u16::try_from(len).map_err(|_| WriteError::LengthEncodingOverflow("u16::MAX"))?;
+    match len {
+        0..=0x7f => dst.push(len as u8),
+        0x80..=0x3fff => {
+            dst.push(((len & 0x7f) as u8) | 0x80);
+            dst.push((len >> 7) as u8);
+        }
+        _ => {
+            dst.push(((len & 0x7f) as u8) | 0x80);
+            dst.push((((len >> 7) & 0x7f) as u8) | 0x80);
+            dst.push((len >> 14) as u8);
+        }
+    }
+    Ok(())
+}
+
+fn checked_add(lhs: usize, rhs: usize) -> WriteResult<usize> {
+    lhs.checked_add(rhs)
+        .ok_or(WriteError::Custom("serialized transaction size overflow"))
+}
+
+fn checked_mul(lhs: usize, rhs: usize) -> WriteResult<usize> {
+    lhs.checked_mul(rhs)
+        .ok_or(WriteError::Custom("serialized transaction size overflow"))
 }
 
 #[derive(DeriveRead, DeriveWrite)]
