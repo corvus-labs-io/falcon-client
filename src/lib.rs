@@ -62,8 +62,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const INITIAL_MTU: u16 = 1472;
 const INITIAL_RTT: Duration = Duration::from_millis(10);
-const SOCKET_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-const BUSY_POLL_MICROS: i32 = 50;
 
 /// Selects how transactions are delivered over the QUIC connection.
 ///
@@ -512,28 +510,6 @@ fn create_udp_socket(addr: SocketAddr) -> Result<UdpSocket> {
         Domain::IPV4
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_send_buffer_size(SOCKET_BUFFER_SIZE)?;
-    socket.set_recv_buffer_size(SOCKET_BUFFER_SIZE)?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-
-        let result = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_BUSY_POLL,
-                (&BUSY_POLL_MICROS as *const i32).cast(),
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-        if result != 0 {
-            warn!(
-                error = %std::io::Error::last_os_error(),
-                "failed to set SO_BUSY_POLL on falcon client socket"
-            );
-        }
-    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())
