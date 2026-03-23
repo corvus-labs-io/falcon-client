@@ -311,5 +311,3 @@ fn create_dummy_transaction() -> VersionedTransaction {
         message,
     }
 }
-
-
