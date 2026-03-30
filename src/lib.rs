@@ -18,7 +18,7 @@
 //! let api_key = Uuid::parse_str("your-api-key-here")?;
 //! let mut client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
 //!
-//! // Switch to datagrams if co-located with Falcon (same DC).
+//! // Datagrams are available for lowest latency when packet loss is negligible.
 //! client.set_transport_mode(TransportMode::Datagram);
 //!
 //! let transaction: VersionedTransaction = todo!();
@@ -26,30 +26,28 @@
 //! # Ok(())
 //! # }
 //! ```
-//! # Debug mode
-//!
-//! Call [`FalconClient::subscribe_debug`] to receive real-time processing
-//! events for your transactions. See [`DebugEvent`] for event types.
-//!
 
-mod debug;
 mod tls;
 mod wire;
 
-pub use debug::{DebugEvent, DebugEventKind};
 pub use wire::{deserialize_transaction, serialize_transaction};
 
 use {
     anyhow::{Context, Result, anyhow},
     arc_swap::ArcSwap,
-    debug::{CONTROL_SUBSCRIBE, MAX_DEBUG_EVENT_SIZE, STREAM_PREFIX_CONTROL},
+    bytes::Bytes,
     quinn::{
-        ClientConfig, Connection, Endpoint, IdleTimeout, SendDatagramError, TransportConfig,
-        VarInt, crypto::rustls::QuicClientConfig,
+        AckFrequencyConfig, ClientConfig, Connection, Endpoint, EndpointConfig, IdleTimeout,
+        SendDatagramError, TransportConfig, VarInt, crypto::rustls::QuicClientConfig,
     },
     rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair},
+    socket2::{Domain, Protocol, Socket, Type},
     solana_transaction::versioned::VersionedTransaction,
-    std::{net::SocketAddr, sync::Arc, time::Duration},
+    std::{
+        net::{SocketAddr, UdpSocket},
+        sync::Arc,
+        time::Duration,
+    },
     tls::{SkipServerVerification, crypto_provider},
     tokio::sync::Mutex,
     tracing::warn,
@@ -58,12 +56,12 @@ use {
 
 const ALPN_FALCON_TX: &[u8] = b"falcon-tx";
 const SERVER_NAME: &str = "falcon";
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(25);
-const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const INITIAL_MTU: u16 = 1472;
-const DEBUG_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIAL_RTT: Duration = Duration::from_millis(10);
 
 /// Selects how transactions are delivered over the QUIC connection.
 ///
@@ -72,12 +70,12 @@ const DEBUG_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// with no reconnect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TransportMode {
-    /// Reliable delivery via unidirectional QUIC streams.
+    /// Reliable delivery via bidirectional QUIC streams.
     ///
-    /// Each transaction opens a stream, writes the payload, and finishes.
-    /// QUIC retransmits lost packets automatically. The combined open +
-    /// write + finish operation is bounded by [`FalconClient::set_send_timeout`]
-    /// (default 500ms).
+    /// Each transaction opens a stream, writes the payload, then waits for a
+    /// server ack. QUIC retransmits lost packets automatically. The combined
+    /// open + write + ack roundtrip is bounded by
+    /// [`FalconClient::set_send_timeout`] (default 500ms).
     #[default]
     Stream,
 
@@ -95,6 +93,89 @@ pub enum TransportMode {
     ///
     /// [RFC 9221]: https://datatracker.ietf.org/doc/html/rfc9221
     Datagram,
+}
+
+/// Optional client connection settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FalconClientConfig {
+    local_addr: SocketAddr,
+    mtu_discovery: bool,
+}
+
+impl Default for FalconClientConfig {
+    fn default() -> Self {
+        Self {
+            local_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            mtu_discovery: true,
+        }
+    }
+}
+
+impl FalconClientConfig {
+    /// Binds the client socket to `local_addr`.
+    pub fn with_bind_addr(mut self, local_addr: SocketAddr) -> Self {
+        self.local_addr = local_addr;
+        self
+    }
+
+    /// Enables or disables DPLPMTUD for future connections.
+    pub fn with_mtu_discovery(mut self, enabled: bool) -> Self {
+        self.mtu_discovery = enabled;
+        self
+    }
+}
+
+/// Error returned when the server rejects a transaction submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitError {
+    /// Server rate-limited this submission.
+    RateLimited,
+    /// Transaction has no valid signature.
+    Unsigned,
+    /// Transaction does not include required tip.
+    MissingTip,
+    /// Could not deserialize the transaction.
+    DeserializeFailed,
+    /// Transaction exceeds maximum allowed size.
+    TooLarge,
+    /// Server failed to forward the transaction.
+    ForwardFailed,
+    /// Transaction signature count does not match.
+    SignatureCountMismatch,
+    /// Server returned an unknown error code.
+    Unknown(u8),
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited => write!(f, "rate limited"),
+            Self::Unsigned => write!(f, "unsigned transaction"),
+            Self::MissingTip => write!(f, "missing required tip"),
+            Self::DeserializeFailed => write!(f, "failed to deserialize transaction"),
+            Self::TooLarge => write!(f, "transaction too large"),
+            Self::ForwardFailed => write!(f, "server failed to forward transaction"),
+            Self::SignatureCountMismatch => write!(f, "signature count mismatch"),
+            Self::Unknown(code) => write!(f, "unknown server error (code {code:#x})"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
+impl SubmitError {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0x01 => Self::RateLimited,
+            0x02 => Self::Unsigned,
+            0x03 => Self::MissingTip,
+            0x04 => Self::DeserializeFailed,
+            0x05 => Self::TooLarge,
+            0x06 => Self::ForwardFailed,
+            0x07 => Self::SignatureCountMismatch,
+            other => Self::Unknown(other),
+        }
+    }
 }
 
 fn generate_client_cert(
@@ -133,9 +214,9 @@ fn generate_client_cert(
 ///
 /// # Transport modes
 ///
-/// Defaults to [`TransportMode::Stream`] (reliable). Call
+/// Defaults to [`TransportMode::Stream`] (reliable delivery). Call
 /// [`set_transport_mode`](Self::set_transport_mode) to switch to
-/// [`TransportMode::Datagram`] for lower-latency fire-and-forget delivery.
+/// [`TransportMode::Datagram`] for fire-and-forget delivery with lowest latency.
 /// See [`TransportMode`] for trade-offs.
 pub struct FalconClient {
     endpoint: Endpoint,
@@ -145,18 +226,12 @@ pub struct FalconClient {
     reconnect: Mutex<()>,
     transport_mode: TransportMode,
     send_timeout: Duration,
-    debug_listener: Mutex<Option<DebugSubscription>>,
-}
-
-struct DebugSubscription {
-    reader: tokio::task::JoinHandle<()>,
-    send: quinn::SendStream,
 }
 
 impl FalconClient {
     /// Connects to Falcon, binding to an ephemeral local port.
     pub async fn connect(endpoint_addr: &str, api_key: Uuid) -> Result<Self> {
-        Self::connect_with_bind(endpoint_addr, api_key, "0.0.0.0:0".parse()?).await
+        Self::connect_with_config(endpoint_addr, api_key, FalconClientConfig::default()).await
     }
 
     /// Connects to Falcon, binding to `local_addr`.
@@ -168,40 +243,22 @@ impl FalconClient {
         api_key: Uuid,
         local_addr: SocketAddr,
     ) -> Result<Self> {
-        let (cert, key) = generate_client_cert(api_key)?;
+        Self::connect_with_config(
+            endpoint_addr,
+            api_key,
+            FalconClientConfig::default().with_bind_addr(local_addr),
+        )
+        .await
+    }
 
-        let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
-            .with_safe_default_protocol_versions()
-            .context("TLS config failed")?
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_client_auth_cert(vec![cert], key)
-            .context("client cert config failed")?;
-
-        crypto.alpn_protocols = vec![ALPN_FALCON_TX.to_vec()];
-
-        let quic_crypto =
-            QuicClientConfig::try_from(crypto).map_err(|e| anyhow!("QUIC config failed: {e}"))?;
-
-        let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
-        transport.max_idle_timeout(Some(
-            IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("valid timeout"),
-        ));
-        transport.initial_mtu(INITIAL_MTU);
-        transport.mtu_discovery_config(None);
-        // Enable datagram negotiation so Datagram mode works without reconnect.
-        transport.datagram_receive_buffer_size(Some(65535));
-        // Allow server to open uni streams for debug events.
-        transport.max_concurrent_uni_streams(VarInt::from_u32(2));
-        // Client never accepts server-initiated bi-streams.
-        transport.max_concurrent_bidi_streams(VarInt::from_u32(0));
-
-        let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
-        client_config.transport_config(Arc::new(transport));
-
-        let mut endpoint = Endpoint::client(local_addr)?;
-        endpoint.set_default_client_config(client_config.clone());
+    /// Connects to Falcon using an explicit client configuration.
+    pub async fn connect_with_config(
+        endpoint_addr: &str,
+        api_key: Uuid,
+        config: FalconClientConfig,
+    ) -> Result<Self> {
+        let client_config = build_client_config(api_key, config.mtu_discovery)?;
+        let endpoint = build_endpoint(config.local_addr, &client_config)?;
 
         let addr = tokio::net::lookup_host(endpoint_addr)
             .await
@@ -209,10 +266,7 @@ impl FalconClient {
             .next()
             .ok_or_else(|| anyhow!("address resolution failed: {endpoint_addr}"))?;
 
-        let connection =
-            tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, SERVER_NAME)?)
-                .await
-                .context("connect timeout")??;
+        let connection = connect_with_handshake(&endpoint, client_config.clone(), addr).await?;
 
         Ok(Self {
             endpoint,
@@ -222,7 +276,6 @@ impl FalconClient {
             reconnect: Mutex::new(()),
             transport_mode: TransportMode::default(),
             send_timeout: SEND_TIMEOUT,
-            debug_listener: Mutex::new(None),
         })
     }
 
@@ -233,7 +286,7 @@ impl FalconClient {
     }
 
     /// Overrides the send timeout for stream mode (default 500ms).
-    /// Covers the full open_uni + write_all + finish cycle.
+    /// Covers the full open_bi + write_all + response cycle.
     /// Has no effect in datagram mode.
     pub fn set_send_timeout(&mut self, timeout: Duration) {
         self.send_timeout = timeout;
@@ -246,13 +299,14 @@ impl FalconClient {
     pub async fn send_transaction(&self, transaction: &VersionedTransaction) -> Result<()> {
         let payload = wire::serialize_transaction(transaction)
             .map_err(|e| anyhow!("wincode serialize failed: {e}"))?;
-        self.send_transaction_payload(&payload).await
+        self.send_transaction_bytes(Bytes::from(payload)).await
     }
 
-    /// Sends a pre-serialized transaction payload. Same retry semantics
-    /// as [`send_transaction`](Self::send_transaction).
-    pub async fn send_transaction_payload(&self, payload: &[u8]) -> Result<()> {
-        if self.try_send(payload).await.is_ok() {
+    /// Sends a pre-serialized transaction payload without copying owned bytes.
+    ///
+    /// Same retry semantics as [`send_transaction`](Self::send_transaction).
+    pub async fn send_transaction_bytes(&self, payload: Bytes) -> Result<()> {
+        if self.try_send(payload.clone()).await.is_ok() {
             return Ok(());
         }
 
@@ -261,14 +315,21 @@ impl FalconClient {
         self.try_send(payload).await
     }
 
-    async fn try_send(&self, payload: &[u8]) -> Result<()> {
+    /// Sends a pre-serialized transaction payload. Same retry semantics
+    /// as [`send_transaction`](Self::send_transaction).
+    pub async fn send_transaction_payload(&self, payload: &[u8]) -> Result<()> {
+        self.send_transaction_bytes(Bytes::copy_from_slice(payload))
+            .await
+    }
+
+    async fn try_send(&self, payload: Bytes) -> Result<()> {
         match self.transport_mode {
-            TransportMode::Stream => self.send_stream(payload).await,
+            TransportMode::Stream => self.send_stream(payload.as_ref()).await,
             TransportMode::Datagram => self.send_datagram(payload),
         }
     }
 
-    fn send_datagram(&self, payload: &[u8]) -> Result<()> {
+    fn send_datagram(&self, payload: Bytes) -> Result<()> {
         let conn = self.connection.load();
 
         let max = conn
@@ -282,26 +343,35 @@ impl FalconClient {
             );
         }
 
-        conn.send_datagram(bytes::Bytes::copy_from_slice(payload))
-            .map_err(|e| match e {
-                SendDatagramError::UnsupportedByPeer => anyhow!("datagrams not supported by peer"),
-                SendDatagramError::Disabled => anyhow!("datagrams disabled in transport config"),
-                SendDatagramError::TooLarge => {
-                    anyhow!("datagram exceeds path MTU ({} bytes)", payload.len())
-                }
-                SendDatagramError::ConnectionLost(reason) => {
-                    anyhow!("connection lost: {reason}")
-                }
-            })
+        let payload_len = payload.len();
+        conn.send_datagram(payload).map_err(|e| match e {
+            SendDatagramError::UnsupportedByPeer => anyhow!("datagrams not supported by peer"),
+            SendDatagramError::Disabled => anyhow!("datagrams disabled in transport config"),
+            SendDatagramError::TooLarge => {
+                anyhow!("datagram exceeds path MTU ({payload_len} bytes)")
+            }
+            SendDatagramError::ConnectionLost(reason) => anyhow!("connection lost: {reason}"),
+        })
     }
 
     async fn send_stream(&self, payload: &[u8]) -> Result<()> {
         let conn = self.connection.load();
         tokio::time::timeout(self.send_timeout, async {
-            let mut stream = conn.open_uni().await?;
-            stream.write_all(payload).await?;
-            stream.finish()?;
-            Ok::<_, anyhow::Error>(())
+            let (mut send, mut recv) = conn.open_bi().await?;
+            send.write_all(&[0x01]).await?;
+            send.write_all(payload).await?;
+            send.finish()?;
+
+            let mut resp = [0u8; 2];
+            recv.read_exact(&mut resp)
+                .await
+                .context("failed to read server response")?;
+
+            if resp[1] == 0x00 {
+                Ok(())
+            } else {
+                Err(SubmitError::from_code(resp[1]).into())
+            }
         })
         .await
         .context("send timeout")?
@@ -321,13 +391,30 @@ impl FalconClient {
             return Ok(());
         }
 
-        let connection = tokio::time::timeout(
-            CONNECT_TIMEOUT,
+        let connecting =
             self.endpoint
-                .connect_with(self.client_config.clone(), self.addr, SERVER_NAME)?,
-        )
-        .await
-        .context("connect timeout")??;
+                .connect_with(self.client_config.clone(), self.addr, SERVER_NAME)?;
+
+        let connection = match connecting.into_0rtt() {
+            Ok((connection, zero_rtt_accepted)) => {
+                // Wait for server to accept 0-RTT before using the connection.
+                // The connection is usable either way — if 0-RTT is accepted, the wait is nearly instant.
+                // If rejected, the wait is one RTT while the handshake completes.
+                match tokio::time::timeout(CONNECT_TIMEOUT, zero_rtt_accepted).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!("server rejected 0-RTT on reconnect");
+                    }
+                    Err(_) => {
+                        warn!("timed out waiting for 0-RTT confirmation");
+                    }
+                }
+                connection
+            }
+            Err(connecting) => tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                .await
+                .context("connect timeout")??,
+        };
 
         self.connection.store(Arc::new(connection));
         Ok(())
@@ -345,97 +432,87 @@ impl FalconClient {
     pub fn close(&self) {
         self.connection.load().close(VarInt::from_u32(0), b"done");
     }
-
-    /// Subscribes to real-time debug events for this connection.
-    ///
-    /// Opens a bi-directional QUIC stream to the server carrying the
-    /// subscribe signal on the send half and debug events on the recv half.
-    /// Only one subscription is active at a time — call
-    /// [`unsubscribe_debug`](Self::unsubscribe_debug) first to re-subscribe.
-    ///
-    /// The debug stream has no impact on transaction processing performance.
-    pub async fn subscribe_debug(&self) -> Result<tokio::sync::mpsc::Receiver<DebugEvent>> {
-        let mut guard = self.debug_listener.lock().await;
-        // Auto-clear stale subscription whose reader has already exited (e.g. connection drop).
-        if matches!(guard.as_ref(), Some(sub) if sub.reader.is_finished()) {
-            guard.take();
-        }
-        if guard.is_some() {
-            anyhow::bail!(
-                "already subscribed to debug events \u{2014} call unsubscribe_debug first"
-            );
-        }
-
-        let conn = self.connection.load_full();
-
-        // Open a bi-stream: send half carries subscribe, recv half delivers events.
-        let (send, recv) = tokio::time::timeout(DEBUG_CONTROL_TIMEOUT, async {
-            let (mut send, recv) = conn
-                .open_bi()
-                .await
-                .context("failed to open debug bi-stream")?;
-            send.write_all(&[STREAM_PREFIX_CONTROL, CONTROL_SUBSCRIBE])
-                .await
-                .context("failed to send subscribe")?;
-            Ok::<_, anyhow::Error>((send, recv))
-        })
-        .await
-        .context("debug subscribe timeout")??;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
-
-        let reader = tokio::spawn(async move {
-            read_debug_stream(recv, tx).await;
-        });
-
-        *guard = Some(DebugSubscription { reader, send });
-        Ok(rx)
-    }
-
-    /// Unsubscribes from debug events without closing the connection.
-    ///
-    /// Closes the debug bi-stream's send half, which the server interprets as
-    /// an unsubscribe. Waits briefly for a final [`DebugEventKind::Unsubscribed`]
-    /// event, then tears down the listener. Transaction flow is unaffected.
-    pub async fn unsubscribe_debug(&self) -> Result<()> {
-        let sub = self.debug_listener.lock().await.take();
-        if let Some(mut sub) = sub {
-            let _ = sub.send.finish();
-            let abort = sub.reader.abort_handle();
-            if tokio::time::timeout(Duration::from_millis(200), sub.reader)
-                .await
-                .is_err()
-            {
-                abort.abort();
-            }
-        }
-        Ok(())
-    }
 }
 
-async fn read_debug_stream(mut recv: quinn::RecvStream, tx: tokio::sync::mpsc::Sender<DebugEvent>) {
-    loop {
-        let mut len_buf = [0u8; 4];
-        if recv.read_exact(&mut len_buf).await.is_err() {
-            break;
-        }
-        let frame_len = u32::from_le_bytes(len_buf) as usize;
-        if frame_len > MAX_DEBUG_EVENT_SIZE {
-            break;
-        }
+fn build_client_config(api_key: Uuid, mtu_discovery: bool) -> Result<ClientConfig> {
+    let (cert, key) = generate_client_cert(api_key)?;
 
-        let mut event_buf = vec![0u8; frame_len];
-        if recv.read_exact(&mut event_buf).await.is_err() {
-            break;
-        }
+    let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .context("TLS config failed")?
+        .dangerous()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_client_auth_cert(vec![cert], key)
+        .context("client cert config failed")?;
 
-        let Ok(event) = DebugEvent::from_bytes(&event_buf) else {
-            continue;
-        };
-        if tx.send(event).await.is_err() {
-            break;
-        }
+    crypto.enable_early_data = true;
+    crypto.alpn_protocols = vec![ALPN_FALCON_TX.to_vec()];
+
+    let quic_crypto =
+        QuicClientConfig::try_from(crypto).map_err(|e| anyhow!("QUIC config failed: {e}"))?;
+
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    transport.max_idle_timeout(Some(
+        IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("valid timeout"),
+    ));
+    transport.initial_rtt(INITIAL_RTT);
+    transport.initial_mtu(INITIAL_MTU);
+    if !mtu_discovery {
+        transport.mtu_discovery_config(None);
     }
+    let mut ack_frequency = AckFrequencyConfig::default();
+    ack_frequency
+        .ack_eliciting_threshold(VarInt::from_u32(0))
+        .max_ack_delay(Some(Duration::ZERO))
+        .reordering_threshold(VarInt::from_u32(2));
+    transport.ack_frequency_config(Some(ack_frequency));
+    transport.datagram_receive_buffer_size(Some(65_535));
+    transport.max_concurrent_uni_streams(VarInt::from_u32(0));
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(256));
+
+    let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
+    client_config.transport_config(Arc::new(transport));
+    Ok(client_config)
+}
+
+fn build_endpoint(local_addr: SocketAddr, client_config: &ClientConfig) -> Result<Endpoint> {
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
+    let socket = create_udp_socket(local_addr)?;
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        None,
+        runtime.wrap_udp_socket(socket)?,
+        runtime,
+    )?;
+    endpoint.set_default_client_config(client_config.clone());
+    Ok(endpoint)
+}
+
+async fn connect_with_handshake(
+    endpoint: &Endpoint,
+    client_config: ClientConfig,
+    addr: SocketAddr,
+) -> Result<Connection> {
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        endpoint.connect_with(client_config, addr, SERVER_NAME)?,
+    )
+    .await
+    .context("connect timeout")?
+    .map_err(Into::into)
+}
+
+fn create_udp_socket(addr: SocketAddr) -> Result<UdpSocket> {
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 #[cfg(test)]
@@ -502,10 +579,11 @@ mod tests {
     fn constants_have_expected_values() {
         assert_eq!(ALPN_FALCON_TX, b"falcon-tx");
         assert_eq!(SERVER_NAME, "falcon");
-        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(25));
-        assert_eq!(MAX_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(60));
+        assert_eq!(MAX_IDLE_TIMEOUT, Duration::from_secs(120));
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
-        assert_eq!(SEND_TIMEOUT, Duration::from_millis(500));
+        assert_eq!(SEND_TIMEOUT, Duration::from_millis(100));
         assert_eq!(INITIAL_MTU, 1472);
+        assert_eq!(INITIAL_RTT, Duration::from_millis(10));
     }
 }

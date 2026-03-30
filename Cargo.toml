@@ -12,9 +12,11 @@ version     = "0.0.5-wincode"
 anyhow         = "1"
 bytes          = "1"
 arc-swap       = "1"
+libc           = { workspace = true }
 quinn          = "0.11.6"
 rcgen          = "0.14"
 rustls         = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
+socket2        = { workspace = true }
 thiserror      = "2.0.17"
 tokio          = { version = "1.48.0", features = ["sync", "time", "net"] }
 tracing        = "0.1.40"
