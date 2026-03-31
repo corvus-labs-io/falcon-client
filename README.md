@@ -8,7 +8,7 @@ It maintains a persistent mTLS connection, defaults to reliable stream delivery,
 
 ```toml
 [dependencies]
-falcon-client = { git = "https://github.com/corvus-labs-io/falcon-client" }
+falcon-client = "0.1"
 bytes = "1" # only needed for send_transaction_bytes
 uuid = "1"
 ```
@@ -165,8 +165,8 @@ On send failure, the client reconnects once (using 0-RTT if session tickets are 
 
 | Setting             | Value       |
 | ------------------- | ----------- |
-| Keep-alive interval | 60s         |
-| Max idle timeout    | 120s        |
+| Keep-alive interval | 10s         |
+| Max idle timeout    | 30s         |
 | Connect timeout     | 5s          |
 | Stream send timeout | 100ms       |
 | Initial MTU         | 1472        |

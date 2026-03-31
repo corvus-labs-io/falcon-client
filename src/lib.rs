@@ -56,8 +56,8 @@ use {
 
 const ALPN_FALCON_TX: &[u8] = b"falcon-tx";
 const SERVER_NAME: &str = "falcon";
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
-const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const INITIAL_MTU: u16 = 1472;
@@ -579,8 +579,8 @@ mod tests {
     fn constants_have_expected_values() {
         assert_eq!(ALPN_FALCON_TX, b"falcon-tx");
         assert_eq!(SERVER_NAME, "falcon");
-        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(60));
-        assert_eq!(MAX_IDLE_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(MAX_IDLE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
         assert_eq!(SEND_TIMEOUT, Duration::from_millis(100));
         assert_eq!(INITIAL_MTU, 1472);

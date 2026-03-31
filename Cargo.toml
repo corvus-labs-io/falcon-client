@@ -6,17 +6,17 @@ homepage    = "https://falcon.wtf"
 license     = "Apache-2.0"
 name        = "falcon-client"
 repository  = "https://github.com/corvus-labs-io/falcon-client"
-version     = "0.0.5-wincode"
+version     = "0.1.1"
 
 [dependencies]
 anyhow         = "1"
 bytes          = "1"
 arc-swap       = "1"
-libc           = { workspace = true }
+libc           = "0.2"
 quinn          = "0.11.6"
 rcgen          = "0.14"
 rustls         = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
-socket2        = { workspace = true }
+socket2        = "0.5"
 thiserror      = "2.0.17"
 tokio          = { version = "1.48.0", features = ["sync", "time", "net"] }
 tracing        = "0.1.40"
