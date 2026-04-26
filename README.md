@@ -1,135 +1,185 @@
 # falcon-client
 
-Rust client library for submitting Solana transactions to Falcon via QUIC.
+`falcon-client` submits Solana `VersionedTransaction`s to Falcon over QUIC.
+
+It maintains a persistent mTLS connection, defaults to reliable stream delivery, and retries one failed send after reconnecting once (using 0-RTT when session tickets are available).
 
 ## Installation
 
 ```toml
 [dependencies]
-falcon-client = { git = "https://github.com/corvus-labs-io/falcon-client" }
+falcon-client = "0.1"
+bytes = "1" # only needed for send_transaction_bytes
+uuid = "1"
 ```
 
-## Quick Start
+## API at a glance
+
+| API                                                                   | Purpose                                                     |
+| --------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `FalconClient::connect(endpoint_addr, api_key)`                       | Connect using an ephemeral local UDP port                   |
+| `FalconClient::connect_with_bind(endpoint_addr, api_key, local_addr)` | Connect using a fixed local bind address/port               |
+| `FalconClient::connect_with_config(endpoint_addr, api_key, config)`   | Connect with explicit client config                         |
+| `FalconClientConfig::with_bind_addr(local_addr)`                      | Set local bind address                                      |
+| `FalconClientConfig::with_mtu_discovery(enabled)`                     | Enable/disable MTU discovery for future connections         |
+| `client.send_transaction(&tx)`                                        | Serialize a `VersionedTransaction` with wincode and send it |
+| `client.send_transaction_bytes(payload)`                              | Send pre-serialized `Bytes`                                 |
+| `client.send_transaction_payload(payload)`                            | Send a pre-serialized `&[u8]`                               |
+| `client.set_transport_mode(mode)`                                     | Switch between stream and datagram delivery                 |
+| `client.set_send_timeout(duration)`                                   | Override stream-mode send timeout                           |
+| `client.is_connected()`                                               | Check whether the current QUIC connection is open           |
+| `client.close()`                                                      | Gracefully close the connection                             |
+
+## Quick start
 
 ```rust
 use falcon_client::FalconClient;
 use solana_transaction::versioned::VersionedTransaction;
 use uuid::Uuid;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let api_key = Uuid::parse_str("your-api-key-here")?;
-    
-    // FalconClient::connect binds to an ephemeral port. 
-    // Use connect_with_bind to specify a static local port for firewall rules.
+async fn example(tx: VersionedTransaction) -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
     let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
 
-    let transaction: VersionedTransaction = /* your transaction */;
-    client.send_transaction(&transaction).await?;
+    client.send_transaction(&tx).await?;
 
+    assert!(client.is_connected());
+    client.close();
     Ok(())
 }
 ```
 
-## Transport Modes
+## Binding a fixed local port
 
-The client supports two delivery mechanisms: reliable streams and unreliable datagrams.
-
-### User Personas
-
-* **Co-located users**: Applications in the same datacenter as Falcon (FRA) experience near-zero packet loss. Datagrams are recommended for lowest latency by removing stream-open overhead.
-* **Fire-and-forget users**: Applications implementing custom retry logic or inclusion checking can use datagrams. Transport-level reliability is redundant in these workflows.
-* **Remote or reliability-critical users**: Applications connecting over the public internet or requiring guaranteed delivery to the Falcon ingress should use streams (default).
-
-### Which mode should I use?
-
-| Scenario | Recommended Mode | Why |
-| :--- | :--- | :--- |
-| Same DC as Falcon | Datagram | Lowest latency, ~0% packet loss |
-| Custom retry logic | Datagram | Avoids redundant transport reliability |
-| Public internet | Stream | QUIC handles packet loss retransmission |
-| Critical delivery | Stream | Guaranteed arrival at ingress |
-
-### Reliability Details
-
-In **Datagram** mode, `send_transaction` returning `Ok` only confirms the packet was handed to the local network stack. If the UDP packet is dropped on the wire, the transaction silently never arrives.
-
-In **Stream** mode, the client opens a unidirectional QUIC stream for each transaction. QUIC automatically handles retransmissions if packets are lost, ensuring the transaction reaches the server.
-
-## Usage Examples
-
-### Stream Mode (Default)
+Use `connect_with_bind` when the local UDP port must be fixed, for example for firewall allowlisting.
 
 ```rust
-let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
-client.send_transaction(&tx).await?;
+use falcon_client::FalconClient;
+use std::net::SocketAddr;
+use uuid::Uuid;
+
+async fn example(api_key: Uuid) -> Result<(), Box<dyn std::error::Error>> {
+    let local_addr: SocketAddr = "0.0.0.0:5002".parse()?;
+    let client = FalconClient::connect_with_bind("fra.falcon.wtf:5000", api_key, local_addr).await?;
+    client.close();
+    Ok(())
+}
 ```
 
-Customize the stream send timeout (default 500ms):
+## Transport modes
+
+### `TransportMode::Stream` (default)
+
+Reliable delivery using a bidirectional QUIC stream. Each send opens a bidi stream, writes a `0x01` prefix followed by the serialized payload, and waits for a 2-byte server response.
+
+### `TransportMode::Datagram`
+
+Fire-and-forget delivery using a single QUIC datagram. No stream overhead — `Ok(())` only means the datagram was queued locally; it may still be dropped in transit.
+
+### Switching modes
+
 ```rust
+use falcon_client::{FalconClient, TransportMode};
+use solana_transaction::versioned::VersionedTransaction;
 use std::time::Duration;
-client.set_send_timeout(Duration::from_millis(200));
+use uuid::Uuid;
+
+async fn example(api_key: Uuid, tx: VersionedTransaction) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+
+    client.set_send_timeout(Duration::from_millis(200));
+    client.send_transaction(&tx).await?;
+
+    client.set_transport_mode(TransportMode::Datagram);
+    client.send_transaction(&tx).await?;
+
+    client.close();
+    Ok(())
+}
 ```
 
-### Datagram Mode (Opt-in)
+## Sending pre-serialized payloads
 
 ```rust
-use falcon_client::TransportMode;
+use bytes::Bytes;
+use falcon_client::{serialize_transaction, FalconClient};
+use solana_transaction::versioned::VersionedTransaction;
+use uuid::Uuid;
 
-let mut client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
-client.set_transport_mode(TransportMode::Datagram);
-client.send_transaction(&tx).await?;
+async fn example(api_key: Uuid, tx: VersionedTransaction) -> Result<(), Box<dyn std::error::Error>> {
+    let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+
+    let payload = serialize_transaction(&tx)?;
+    client.send_transaction_payload(&payload).await?;
+    client.send_transaction_bytes(Bytes::from(payload)).await?;
+
+    client.close();
+    Ok(())
+}
 ```
 
-## Debug Mode (Opt-in)
+## Handling errors
 
-Opt-in real-time event stream showing how your transactions are being processed server-side.
+All send methods return `anyhow::Result<()>`. Server-side rejections can be downcast to `SubmitError`.
 
 ```rust
-let mut rx = client.subscribe_debug().await?;
+use falcon_client::{FalconClient, SubmitError};
+use solana_transaction::versioned::VersionedTransaction;
+use uuid::Uuid;
 
-// Receive events in a background task or loop
-tokio::spawn(async move {
-    while let Some(event) = rx.recv().await {
-        println!("seq={} kind={:?}", event.sequence, event.kind);
+async fn example(api_key: Uuid, tx: VersionedTransaction) -> Result<(), Box<dyn std::error::Error>> {
+    let client = FalconClient::connect("fra.falcon.wtf:5000", api_key).await?;
+
+    match client.send_transaction(&tx).await {
+        Ok(()) => {}
+        Err(err) => match err.downcast_ref::<SubmitError>() {
+            Some(SubmitError::RateLimited) => eprintln!("rate limited"),
+            Some(other) => eprintln!("submission rejected: {other}"),
+            None => eprintln!("transport error: {err}"),
+        },
     }
-});
 
-// Later, unsubscribe without closing the connection
-client.unsubscribe_debug().await?;
+    client.close();
+    Ok(())
+}
 ```
 
-| Event | Fields | Meaning |
-|-------|--------|---------|
-| ValidationOk | signature | Transaction passed validation |
-| ValidationErr | signature, reason | Validation failed |
-| ForwardOk | signature, latencies, bridges, failover | Forwarded to network |
-| ForwardErr | signature, reason | Forward failed |
-| EventsDropped | count | Debug channel was full, events lost |
-| Subscribed | — | Subscription confirmed |
-| Unsubscribed | — | Unsubscription confirmed |
+## `SubmitError`
 
-* Sequence numbers are monotonic per connection, gaps indicate dropped events.
-* Debug mode has zero impact on transaction processing (non-blocking).
-* Only one active subscription per connection, call `unsubscribe_debug` before re-subscribing.
+| Variant                  | Meaning                                       |
+| ------------------------ | --------------------------------------------- |
+| `RateLimited`            | Server rate-limited the submission            |
+| `Unsigned`               | Transaction has no valid signature            |
+| `MissingTip`             | Required tip was missing                      |
+| `DeserializeFailed`      | Server could not deserialize the payload      |
+| `TooLarge`               | Transaction exceeded the maximum allowed size |
+| `ForwardFailed`          | Server failed to forward the transaction      |
+| `SignatureCountMismatch` | Signature count did not match the message     |
+| `Unknown(u8)`            | Unrecognized server error code                |
 
+## Reconnect behavior
 
-## Connection Parameters
+On send failure, the client reconnects once (using 0-RTT if session tickets are available) and retries the send. Reconnects are serialized to prevent stampede — if another task already replaced the connection, the current task reuses it.
 
-| Parameter | Value | Description |
-| :--- | :--- | :--- |
-| Keep-alive interval | 10s | QUIC keep-alive ping interval |
-| Idle timeout | 30s | Connection closed after inactivity |
-| Connect timeout | 5s | Initial connection timeout |
-| Send timeout | 500ms | Stream open and write timeout (stream only) |
-| Initial MTU | 1472 | Matches Falcon server MTU |
+## Connection defaults
 
-## Transport Details
+| Setting             | Value       |
+| ------------------- | ----------- |
+| Keep-alive interval | 10s         |
+| Max idle timeout    | 30s         |
+| Connect timeout     | 5s          |
+| Stream send timeout | 100ms       |
+| Initial MTU         | 1472        |
+| Initial RTT         | 10ms        |
+| ALPN                | `falcon-tx` |
+| Default transport   | Stream      |
 
-* **Protocol**: QUIC via quinn
-* **TLS**: rustls with X25519 and mTLS client certificates
-* **ALPN**: `falcon-tx`
-* **Serialization**: wincode
+## TLS
+
+- QUIC via `quinn`, TLS via `rustls`
+- X25519 key exchange only
+- mTLS with self-signed client certificate; API key embedded in CN
+- Server certificate chains are not CA-validated; handshake signatures are verified
 
 ## License
 
