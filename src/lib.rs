@@ -4,7 +4,7 @@
 //!
 //! | Mode | Delivery | Best for |
 //! |------|----------|----------|
-//! | [`TransportMode::Stream`] (default) | Reliable (QUIC retransmits) | Remote users, guaranteed delivery |
+//! | [`TransportMode::Stream`] (default) | Datagram-first with stream ack backup | Remote users, fast delivery with server errors |
 //! | [`TransportMode::Datagram`] (opt-in) | Fire-and-forget | Co-located users, custom retry logic |
 //!
 //! # Quick start
@@ -62,6 +62,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const INITIAL_MTU: u16 = 1472;
 const INITIAL_RTT: Duration = Duration::from_millis(10);
+const TX_STREAM_PREFIX: u8 = 0x01;
+const RESPONSE_PREFIX: u8 = 0x01;
+const RESPONSE_ACCEPTED: u8 = 0x00;
 
 /// Selects how transactions are delivered over the QUIC connection.
 ///
@@ -70,12 +73,14 @@ const INITIAL_RTT: Duration = Duration::from_millis(10);
 /// with no reconnect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TransportMode {
-    /// Reliable delivery via bidirectional QUIC streams.
+    /// Datagram-first delivery with a bidirectional stream ack backup.
     ///
-    /// Each transaction opens a stream, writes the payload, then waits for a
-    /// server ack. QUIC retransmits lost packets automatically. The combined
-    /// open + write + ack roundtrip is bounded by
-    /// [`FalconClient::set_send_timeout`] (default 500ms).
+    /// Each transaction is queued as a QUIC datagram first, then sent on a
+    /// stream that returns a server ack. Static server rejections are still
+    /// returned to the caller. If the datagram was queued and the stream path
+    /// fails before returning an ack, the send is treated as successful to
+    /// avoid a redundant retry of bytes already on the wire. The stream backup
+    /// is bounded by [`FalconClient::set_send_timeout`] (default 100ms).
     #[default]
     Stream,
 
@@ -214,7 +219,8 @@ fn generate_client_cert(
 ///
 /// # Transport modes
 ///
-/// Defaults to [`TransportMode::Stream`] (reliable delivery). Call
+/// Defaults to [`TransportMode::Stream`] (datagram-first delivery with a
+/// stream ack backup). Call
 /// [`set_transport_mode`](Self::set_transport_mode) to switch to
 /// [`TransportMode::Datagram`] for fire-and-forget delivery with lowest latency.
 /// See [`TransportMode`] for trade-offs.
@@ -285,7 +291,7 @@ impl FalconClient {
         self.transport_mode = mode;
     }
 
-    /// Overrides the send timeout for stream mode (default 500ms).
+    /// Overrides the send timeout for stream mode (default 100ms).
     /// Covers the full open_bi + write_all + response cycle.
     /// Has no effect in datagram mode.
     pub fn set_send_timeout(&mut self, timeout: Duration) {
@@ -324,14 +330,17 @@ impl FalconClient {
 
     async fn try_send(&self, payload: Bytes) -> Result<()> {
         match self.transport_mode {
-            TransportMode::Stream => self.send_stream(payload.as_ref()).await,
+            TransportMode::Stream => self.send_stream_with_datagram_race(payload).await,
             TransportMode::Datagram => self.send_datagram(payload),
         }
     }
 
     fn send_datagram(&self, payload: Bytes) -> Result<()> {
-        let conn = self.connection.load();
+        let conn = self.connection.load_full();
+        Self::send_datagram_on(&conn, payload)
+    }
 
+    fn send_datagram_on(conn: &Connection, payload: Bytes) -> Result<()> {
         let max = conn
             .max_datagram_size()
             .ok_or_else(|| anyhow!("datagrams not supported by peer"))?;
@@ -354,11 +363,28 @@ impl FalconClient {
         })
     }
 
-    async fn send_stream(&self, payload: &[u8]) -> Result<()> {
-        let conn = self.connection.load();
+    async fn send_stream_with_datagram_race(&self, payload: Bytes) -> Result<()> {
+        let conn = self.connection.load_full();
+        let datagram_sent = Self::send_datagram_on(&conn, payload.clone()).is_ok();
+
+        match self.send_stream_on(&conn, payload.as_ref()).await {
+            Ok(()) => Ok(()),
+            Err(err)
+                if datagram_sent
+                    && conn.close_reason().is_none()
+                    && err.downcast_ref::<SubmitError>().is_none() =>
+            {
+                warn!(error = %err, "stream submit failed after datagram was queued");
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn send_stream_on(&self, conn: &Connection, payload: &[u8]) -> Result<()> {
         tokio::time::timeout(self.send_timeout, async {
             let (mut send, mut recv) = conn.open_bi().await?;
-            send.write_all(&[0x01]).await?;
+            send.write_all(&[TX_STREAM_PREFIX]).await?;
             send.write_all(payload).await?;
             send.finish()?;
 
@@ -367,7 +393,15 @@ impl FalconClient {
                 .await
                 .context("failed to read server response")?;
 
-            if resp[1] == 0x00 {
+            if resp[0] != RESPONSE_PREFIX {
+                anyhow::bail!(
+                    "unexpected Falcon response prefix {:#x}, code {:#x}",
+                    resp[0],
+                    resp[1]
+                );
+            }
+
+            if resp[1] == RESPONSE_ACCEPTED {
                 Ok(())
             } else {
                 Err(SubmitError::from_code(resp[1]).into())
@@ -585,5 +619,8 @@ mod tests {
         assert_eq!(SEND_TIMEOUT, Duration::from_millis(100));
         assert_eq!(INITIAL_MTU, 1472);
         assert_eq!(INITIAL_RTT, Duration::from_millis(10));
+        assert_eq!(TX_STREAM_PREFIX, 0x01);
+        assert_eq!(RESPONSE_PREFIX, 0x01);
+        assert_eq!(RESPONSE_ACCEPTED, 0x00);
     }
 }
