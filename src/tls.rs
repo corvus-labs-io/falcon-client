@@ -16,7 +16,7 @@ pub fn crypto_provider() -> CryptoProvider {
 
 /// TLS certificate verifier that skips server certificate chain validation.
 ///
-/// Falcon entrypoints use self-signed certificates, so standard CA chain
+/// Falcons use self-signed certificates, so standard CA chain
 /// verification is not applicable. TLS handshake signatures are still
 /// verified to ensure the peer holds the private key for the presented cert.
 pub struct SkipServerVerification(Arc<CryptoProvider>);

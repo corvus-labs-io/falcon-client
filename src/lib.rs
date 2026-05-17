@@ -147,6 +147,8 @@ pub enum SubmitError {
     ForwardFailed,
     /// Transaction signature count does not match.
     SignatureCountMismatch,
+    /// API key is no longer authorized by the server.
+    Unauthorized,
     /// Server returned an unknown error code.
     Unknown(u8),
 }
@@ -161,6 +163,7 @@ impl std::fmt::Display for SubmitError {
             Self::TooLarge => write!(f, "transaction too large"),
             Self::ForwardFailed => write!(f, "server failed to forward transaction"),
             Self::SignatureCountMismatch => write!(f, "signature count mismatch"),
+            Self::Unauthorized => write!(f, "unauthorized api key"),
             Self::Unknown(code) => write!(f, "unknown server error (code {code:#x})"),
         }
     }
@@ -178,6 +181,7 @@ impl SubmitError {
             0x05 => Self::TooLarge,
             0x06 => Self::ForwardFailed,
             0x07 => Self::SignatureCountMismatch,
+            0x08 => Self::Unauthorized,
             other => Self::Unknown(other),
         }
     }
@@ -607,6 +611,11 @@ mod tests {
     #[test]
     fn default_transport_mode_is_stream() {
         assert_eq!(TransportMode::default(), TransportMode::Stream);
+    }
+
+    #[test]
+    fn submit_error_from_code_maps_unauthorized() {
+        assert_eq!(SubmitError::from_code(0x08), SubmitError::Unauthorized);
     }
 
     #[test]
