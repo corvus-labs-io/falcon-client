@@ -2,7 +2,7 @@
 
 `falcon-client` submits Solana `VersionedTransaction`s to Falcon over QUIC.
 
-It maintains a persistent mTLS connection, defaults to reliable stream delivery, and retries one failed send after reconnecting once (using 0-RTT when session tickets are available).
+It maintains a persistent mTLS connection, defaults to datagram-first delivery with a stream ack backup, and retries one failed send after reconnecting once (using 0-RTT when session tickets are available).
 
 ## Installation
 
@@ -70,11 +70,13 @@ async fn example(api_key: Uuid) -> Result<(), Box<dyn std::error::Error>> {
 
 ### `TransportMode::Stream` (default)
 
-Reliable delivery using a bidirectional QUIC stream. Each send opens a bidi stream, writes a `0x01` prefix followed by the serialized payload, and waits for a 2-byte server response.
+Datagram-first delivery with a bidirectional stream ack backup. Each send queues the transaction as a QUIC datagram, then opens a bidi stream that writes a `0x01` prefix followed by the serialized payload and waits for a 2-byte server response. If the datagram was queued and the stream path fails before returning an ack, the send is treated as successful to avoid retrying bytes that are already on the wire.
 
 ### `TransportMode::Datagram`
 
 Fire-and-forget delivery using a single QUIC datagram. No stream overhead — `Ok(())` only means the datagram was queued locally; it may still be dropped in transit.
+
+Use this mode for the lowest caller-side latency when the client is co-located with Falcon or has its own retry logic.
 
 ### Switching modes
 
@@ -165,14 +167,14 @@ On send failure, the client reconnects once (using 0-RTT if session tickets are 
 
 | Setting             | Value       |
 | ------------------- | ----------- |
-| Keep-alive interval | 10s         |
+| Keep-alive interval | 1s          |
 | Max idle timeout    | 30s         |
 | Connect timeout     | 5s          |
 | Stream send timeout | 100ms       |
 | Initial MTU         | 1472        |
-| Initial RTT         | 10ms        |
+| Initial RTT         | 1ms         |
 | ALPN                | `falcon-tx` |
-| Default transport   | Stream      |
+| Default transport   | Datagram-first stream backup |
 
 ## TLS
 

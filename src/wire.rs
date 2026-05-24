@@ -247,8 +247,9 @@ struct WincodeSignature(#[wincode(with = "[u8; 64]")] [u8; 64]);
 
 impl From<&Signature> for WincodeSignature {
     fn from(s: &Signature) -> Self {
-        let bytes: &[u8] = s.as_ref();
-        WincodeSignature(bytes.try_into().expect("signature is 64 bytes"))
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(s.as_ref());
+        WincodeSignature(bytes)
     }
 }
 

@@ -38,7 +38,8 @@ use {
     bytes::Bytes,
     quinn::{
         AckFrequencyConfig, ClientConfig, Connection, Endpoint, EndpointConfig, IdleTimeout,
-        SendDatagramError, TransportConfig, VarInt, crypto::rustls::QuicClientConfig,
+        SendDatagramError, TransportConfig, VarInt, congestion::CubicConfig,
+        crypto::rustls::QuicClientConfig,
     },
     rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair},
     socket2::{Domain, Protocol, Socket, Type},
@@ -56,12 +57,17 @@ use {
 
 const ALPN_FALCON_TX: &[u8] = b"falcon-tx";
 const SERVER_NAME: &str = "falcon";
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const INITIAL_MTU: u16 = 1472;
-const INITIAL_RTT: Duration = Duration::from_millis(10);
+const INITIAL_RTT: Duration = Duration::from_millis(1);
+const INITIAL_CONGESTION_WINDOW: u64 = 128 * 1232;
+const SEND_WINDOW_BYTES: u64 = 10_000_000;
+const RECEIVE_WINDOW_BYTES: u32 = 8_000_000;
+const STREAM_RECEIVE_WINDOW_BYTES: u32 = 2_000_000;
+const DATAGRAM_BUFFER_BYTES: usize = 2_097_152;
 const TX_STREAM_PREFIX: u8 = 0x01;
 const RESPONSE_PREFIX: u8 = 0x01;
 const RESPONSE_ACCEPTED: u8 = 0x00;
@@ -491,11 +497,21 @@ fn build_client_config(api_key: Uuid, mtu_discovery: bool) -> Result<ClientConfi
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
-    transport.max_idle_timeout(Some(
-        IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("valid timeout"),
-    ));
+    let max_idle_timeout =
+        IdleTimeout::try_from(MAX_IDLE_TIMEOUT).context("invalid QUIC idle timeout")?;
+    transport.max_idle_timeout(Some(max_idle_timeout));
     transport.initial_rtt(INITIAL_RTT);
     transport.initial_mtu(INITIAL_MTU);
+    transport.send_window(SEND_WINDOW_BYTES);
+    transport.receive_window(VarInt::from_u32(RECEIVE_WINDOW_BYTES));
+    transport.stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW_BYTES));
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_BYTES));
+    transport.datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES);
+    transport.send_fairness(false);
+    transport.enable_segmentation_offload(false);
+    let mut cubic = CubicConfig::default();
+    cubic.initial_window(INITIAL_CONGESTION_WINDOW);
+    transport.congestion_controller_factory(Arc::new(cubic));
     if !mtu_discovery {
         transport.mtu_discovery_config(None);
     }
@@ -505,7 +521,6 @@ fn build_client_config(api_key: Uuid, mtu_discovery: bool) -> Result<ClientConfi
         .max_ack_delay(Some(Duration::ZERO))
         .reordering_threshold(VarInt::from_u32(2));
     transport.ack_frequency_config(Some(ack_frequency));
-    transport.datagram_receive_buffer_size(Some(65_535));
     transport.max_concurrent_uni_streams(VarInt::from_u32(0));
     transport.max_concurrent_bidi_streams(VarInt::from_u32(256));
 
@@ -622,12 +637,17 @@ mod tests {
     fn constants_have_expected_values() {
         assert_eq!(ALPN_FALCON_TX, b"falcon-tx");
         assert_eq!(SERVER_NAME, "falcon");
-        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(KEEP_ALIVE_INTERVAL, Duration::from_secs(1));
         assert_eq!(MAX_IDLE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
         assert_eq!(SEND_TIMEOUT, Duration::from_millis(100));
         assert_eq!(INITIAL_MTU, 1472);
-        assert_eq!(INITIAL_RTT, Duration::from_millis(10));
+        assert_eq!(INITIAL_RTT, Duration::from_millis(1));
+        assert_eq!(INITIAL_CONGESTION_WINDOW, 128 * 1232);
+        assert_eq!(SEND_WINDOW_BYTES, 10_000_000);
+        assert_eq!(RECEIVE_WINDOW_BYTES, 8_000_000);
+        assert_eq!(STREAM_RECEIVE_WINDOW_BYTES, 2_000_000);
+        assert_eq!(DATAGRAM_BUFFER_BYTES, 2_097_152);
         assert_eq!(TX_STREAM_PREFIX, 0x01);
         assert_eq!(RESPONSE_PREFIX, 0x01);
         assert_eq!(RESPONSE_ACCEPTED, 0x00);
